@@ -1,6 +1,6 @@
 # AgentCore Policy - Getting Started Demo
 
-A complete, hands-on demo of implementing policy-based security controls for AI agents using Amazon Bedrock AgentCore Policy.
+A complete, hands-on demo of implementing policy-based controls for AI agents using Amazon Bedrock AgentCore Policy.
 
 ## 🚀 Quick Start
 
@@ -12,29 +12,35 @@ A complete, hands-on demo of implementing policy-based security controls for AI 
 
 ## Overview
 
-This demo provides a complete walkthrough of implementing policy-based security controls for AI agent interactions.
+This demo provides a complete walkthrough of implementing policy-based controls for AI agent interactions with tools through AgentCore Gateway.
 
 ## What You'll Learn
 
-- ✅ Setup AgentCore Gateway with Lambda targets
+- ✅ Deploy Lambda functions as agent tools
+- ✅ Setup AgentCore Gateway with multiple Lambda targets
 - ✅ Create and configure Policy Engines
 - ✅ Write Cedar policies for fine-grained access control
-- ✅ Test policy enforcement with real requests
+- ✅ Test policy enforcement with real AI agent requests
+- ✅ Understand ALLOW and DENY scenarios
 
 ## Demo Scenario
 
-We'll build a **refund processing system** with policy controls:
+We'll build an **insurance underwriting processing system** with policy controls:
 
-- **Tool**: RefundTool (Lambda function)
-- **Parameters**: 
-  - `amount` (integer) - The refund amount in USD
-  - `orderId` (string) - Unique identifier for the order
-- **Policy Rule**: Only allow refunds under $1000
+- **Tools**: 
+  - **ApplicationTool** - Creates insurance applications with geographic and eligibility validation
+    - Parameters: `applicant_region` (string), `coverage_amount` (integer)
+  - **RiskModelTool** - Invokes external risk scoring model with governance controls
+    - Parameters: `API_classification` (string), `data_governance_approval` (boolean)
+  - **ApprovalTool** - Approves high-value or high-risk underwriting decisions
+    - Parameters: `claim_amount` (integer), `risk_level` (string)
+
+- **Policy Rule**: Only allow insurance applications with coverage under $1M
 - **Test Cases**: 
-  - ✅ $200 refund (ALLOWED)
-  - ❌ $2000 refund (DENIED)
+  - ✅ $750K application (ALLOWED)
+  - ❌ $1.5M application (DENIED)
 
-> **Important**: Policies can only reference parameters defined in the Gateway target schema. The RefundTool schema includes `amount` and `orderId` parameters.
+> **Important**: Policies can only reference parameters defined in the Gateway target schema. Each tool has its own schema with specific parameters that can be used in policy conditions.
 
 ## Prerequisites
 
@@ -43,9 +49,12 @@ Before starting, ensure you have:
 - AWS CLI configured with appropriate credentials
 - Python 3.10+ with boto3 1.42.0+ installed
 - `bedrock_agentcore_starter_toolkit` package installed
-- Access to AWS Lambda
-- IAM role with trust policy for AgentCore service
+- `strands` package installed (for AI agent functionality)
+- Access to AWS Lambda (for creating target functions)
+- Access to Amazon Bedrock (for AI agent model)
 - Working in **us-east-1 (N.Virginia)** region
+
+> **Note**: The gateway setup script will automatically create the necessary IAM roles with proper trust policies for AgentCore service.
 
 ## Setup Instructions
 
@@ -72,12 +81,15 @@ jupyter notebook AgentCore-Policy-Demo.ipynb
 The notebook guides you through:
 
 1. **Environment Setup** - Verify credentials and dependencies
-2. **Lambda Creation** - Create RefundTool Lambda function
-3. **Gateway Setup** - Configure AgentCore Gateway with OAuth
-4. **Policy Engine** - Create policy engine and Cedar policies
-5. **Testing** - Test ALLOW and DENY scenarios with real AI agents
+2. **Lambda Deployment** - Deploy 3 Lambda functions (ApplicationTool, RiskModelTool, ApprovalTool)
+3. **Gateway Setup** - Configure AgentCore Gateway with OAuth and attach Lambda targets
+4. **Agent Testing** - Test the AI agent with access to all tools (no policies yet)
+5. **Policy Engine** - Create policy engine and attach to gateway
+6. **Cedar Policies** - Write and deploy Cedar policies for access control
+7. **Policy Testing** - Test ALLOW and DENY scenarios with real AI agent requests
+8. **Cleanup** - Remove all created resources
 
-> **Note**: The demo uses boto3's native policy-registry client (available in boto3 1.42.0+), eliminating the need for manual service model configuration.
+> **Note**: The demo uses boto3's native policy-registry client (available in boto3 1.42.0+) and the Strands framework for AI agent functionality.
 
 ## Project Structure
 
@@ -86,13 +98,17 @@ Getting-Started/
 ├── AgentCore-Policy-Demo.ipynb    # Main demo notebook
 ├── README.md                       # This file
 ├── requirements.txt                # Python dependencies
+├── config.json                     # Generated configuration file
 └── scripts/                        # Supporting scripts
-    ├── setup_gateway.py            # Gateway setup
-    ├── create_policies.py          # Policy creation
-    ├── test_gateway_policies.py    # Policy testing
+    ├── setup_gateway.py            # Gateway setup with auto IAM role creation
+    ├── agent_with_tools.py         # AI agent session manager
+    ├── get_client_secret.py        # Retrieve Cognito client secret
     ├── policy_generator.py         # NL to Cedar generation
-    ├── deploy_lambda.py            # Lambda deployment
-    └── refund_tool.mjs             # Lambda function code
+    └── lambda-target-setup/        # Lambda deployment scripts
+        ├── deploy_lambdas.py       # Deploy all 3 Lambda functions
+        ├── application_tool.js     # ApplicationTool Lambda code
+        ├── risk_model_tool.js      # RiskModelTool Lambda code
+        └── approval_tool.js        # ApprovalTool Lambda code
 ```
 
 ## Key Concepts
@@ -129,18 +145,20 @@ permit(
 ```cedar
 permit(
   principal,
-  action == AgentCore::Action::"RefundToolTarget___refund",
+  action == AgentCore::Action::"ApplicationToolTarget___create_application",
   resource == AgentCore::Gateway::"<gateway-arn>"
 ) when {
-  context.input.amount <= 1000
+  context.input.coverage_amount <= 1000000
 };
 ```
 
 This policy:
-- Allows refund requests under $1000
-- Denies refund requests of $1000 or more
-- Applies to the RefundTool target
-- Evaluates the `amount` parameter in real-time
+- Allows insurance application creation with coverage under $1M
+- Denies applications with coverage of $1M or more
+- Applies to the ApplicationTool target
+- Evaluates the `coverage_amount` parameter in real-time
+
+> **Key Insight**: When a Policy Engine is attached to a Gateway in ENFORCE mode, the default action is DENY. You must explicitly create permit policies for each tool you want to allow access to.
 
 ## Architecture
 
@@ -170,18 +188,34 @@ This policy:
 
 ## Testing
 
-The demo includes comprehensive testing:
+The demo includes comprehensive testing with a real AI agent:
+
+### Before Policy Engine Attachment
+- Agent can list all 3 tools
+- Agent can invoke all tools without restrictions
+- No policy enforcement
+
+### After Policy Engine Attachment (Empty)
+- Agent cannot list any tools (default DENY)
+- Agent cannot invoke any tools
+- All requests blocked
+
+### After Adding Application Policy
+- Agent can list ApplicationTool only
+- Agent can create applications under $1M ✅
+- Agent cannot create applications over $1M ❌
+- Other tools remain blocked
 
 ### Test 1: ALLOW Scenario ✅
-- Amount: $200
+- Request: Create application with $750K coverage
 - Expected: ALLOWED
-- Reason: $200 <= $1000
-- Result: Lambda executes, refund processed
+- Reason: $750K <= $1M
+- Result: Lambda executes, application created
 
 ### Test 2: DENY Scenario ❌
-- Amount: $2000
+- Request: Create application with $1.5M coverage
 - Expected: DENIED
-- Reason: $2000 > $1000
+- Reason: $1.5M > $1M
 - Result: Policy blocks request, Lambda never executes
 
 ## Advanced Features
@@ -190,27 +224,43 @@ The demo includes comprehensive testing:
 
 ```cedar
 permit(...) when {
-  context.input.amount <= 1000 &&
-  has(context.input.orderId) &&
-  context.input.orderId != ""
+  context.input.coverage_amount <= 1000000 &&
+  has(context.input.applicant_region) &&
+  context.input.applicant_region == "US"
 };
 ```
 
-### Order-Based Conditions
+### Region-Based Conditions
 
 ```cedar
 permit(...) when {
-  context.input.amount <= 1000 &&
-  context.input.orderId.startsWith("VIP")
+  context.input.applicant_region in ["US", "CA", "UK"]
 };
 ```
 
-### Range-Based Conditions
+### Risk Model Governance
 
 ```cedar
-permit(...) when {
-  context.input.amount >= 100 &&
-  context.input.amount <= 1000
+permit(
+  principal,
+  action == AgentCore::Action::"RiskModelToolTarget___invoke_risk_model",
+  resource == AgentCore::Gateway::"<gateway-arn>"
+) when {
+  context.input.API_classification == "public" &&
+  context.input.data_governance_approval == true
+};
+```
+
+### Approval Thresholds
+
+```cedar
+permit(
+  principal,
+  action == AgentCore::Action::"ApprovalToolTarget___approve_underwriting",
+  resource == AgentCore::Gateway::"<gateway-arn>"
+) when {
+  context.input.claim_amount <= 100000 &&
+  context.input.risk_level in ["low", "medium"]
 };
 ```
 
@@ -218,7 +268,7 @@ permit(...) when {
 
 ```cedar
 forbid(...) when {
-  context.input.amount > 10000
+  context.input.coverage_amount > 10000000
 };
 ```
 
@@ -251,8 +301,19 @@ Policy decisions are logged to CloudWatch:
 
 4. **Module Import Errors**
    - Ensure boto3 1.42.0+ is installed: `pip install --upgrade boto3`
+   - Ensure strands is installed: `pip install strands`
    - Restart Jupyter kernel after updating dependencies
    - Clear Python cache: `rm -rf scripts/__pycache__`
+
+5. **Agent Session Errors**
+   - If you see `MCPClientInitializationError`, restart the notebook kernel
+   - Ensure config.json has the client_secret field populated
+   - Run `scripts/get_client_secret.py` to retrieve the secret if missing
+
+6. **AWS Token Expired**
+   - Refresh AWS credentials: `aws sso login` or `aws configure`
+   - Restart notebook kernel to pick up new credentials
+   - Re-run cells from the beginning
 
 
 ## Additional Resources
