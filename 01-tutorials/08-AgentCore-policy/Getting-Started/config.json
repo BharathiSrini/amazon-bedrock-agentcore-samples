@@ -1,0 +1,22 @@
+{
+  "lambdas": {
+    "ApplicationTool": "arn:aws:lambda:us-east-1:849138760372:function:ApplicationTool",
+    "ApprovalTool": "arn:aws:lambda:us-east-1:849138760372:function:ApprovalTool",
+    "RiskModelTool": "arn:aws:lambda:us-east-1:849138760372:function:RiskModelTool"
+  },
+  "region": "us-east-1",
+  "gateway": {
+    "gateway_url": "https://gw-insurance-underwriting-tcyrotdzns.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp",
+    "gateway_id": "gw-insurance-underwriting-tcyrotdzns",
+    "gateway_arn": "arn:aws:bedrock-agentcore:us-east-1:849138760372:gateway/gw-insurance-underwriting-tcyrotdzns",
+    "gateway_name": "GW-Insurance-Underwriting",
+    "client_info": {
+      "client_id": "458q75odvoavvimckbiihp3qjt",
+      "token_endpoint": "https://agentcore-b3943e7d.auth.us-east-1.amazoncognito.com/oauth2/token",
+      "client_secret": "11jl9g6jtorm9u6ssai8kuepbg9r7cnthaalitjhvrj4mto0sr4t"
+    }
+  },
+  "policy_engine_id": "InsurancePolicyEngine-a23r_dh0ku",
+  "policy_engine_arn": "arn:aws:bedrock-agentcore:us-east-1:849138760372:policy-engine/InsurancePolicyEngine-a23r_dh0ku",
+  "policy_id": "create_application_policy-2h40qtcl9p"
+}
