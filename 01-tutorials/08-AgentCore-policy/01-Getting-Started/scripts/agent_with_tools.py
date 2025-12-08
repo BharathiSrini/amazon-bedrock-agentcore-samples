@@ -52,6 +52,7 @@ def fetch_access_token(client_id, client_secret, token_url):
         token_url,
         data=f"grant_type=client_credentials&client_id={client_id}&client_secret={client_secret}",
         headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=30,
     )
 
     if response.status_code != 200:
