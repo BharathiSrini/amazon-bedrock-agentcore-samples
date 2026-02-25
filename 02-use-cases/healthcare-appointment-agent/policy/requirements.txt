@@ -1,0 +1,7 @@
+# Requirements for AgentCore Policy integration
+# These are in addition to the main healthcare agent requirements
+
+boto3>=1.42.0
+strands-agents>=0.1.0
+bedrock-agentcore>=0.1.0
+requests>=2.31.0
