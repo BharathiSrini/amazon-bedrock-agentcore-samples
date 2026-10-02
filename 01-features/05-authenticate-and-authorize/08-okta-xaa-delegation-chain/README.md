@@ -8,7 +8,9 @@ signed-in user**, and the **gateway** — not the agent — performs the Okta
 
 - **Front end** — a small FastAPI **BFF** (`frontend/app.py`) that signs the user in and
   invokes the agent. It exists so the browser never holds a token: it keeps them
-  server-side and hands the browser a signed, `HttpOnly` session cookie.
+  out of the page and hands the browser a signed, `HttpOnly` session cookie. (That cookie
+  is signed, not encrypted, and the tokens are inside it — fine for localhost, not for
+  production; `frontend/app.py` explains what to change.)
 - **Requesting app** — a [Strands](https://strandsagents.com) agent on **AgentCore
   Runtime**, behind an inbound JWT authorizer. It calls an **AgentCore Gateway** over
   MCP and never holds a credential that can reach the API.
@@ -50,9 +52,8 @@ flowchart LR
 ```
 
 *The API receives a token whose `sub` is the **human** and whose `act.sub` is the
-**agent** — no static API keys, and no tool credential inside the agent. Note where the
-tokens live: the browser holds only a signed session cookie, and every credential stays
-server-side in the BFF or beyond.*
+**agent** — no static API keys, and no tool credential inside the agent. The resource
+credential never leaves the interceptor, and the agent never holds one that opens the API.*
 
 ## How it works
 
@@ -74,7 +75,7 @@ sequenceDiagram
     U->>BFF: GET /
     BFF->>AS1: authorization code + PKCE<br/>client_assertion = AI Agent key
     AS1-->>BFF: T_id + T_user<br/>T_id stays in the BFF session
-    BFF-->>U: session cookie — tokens stay server-side
+    BFF-->>U: signed session cookie<br/>(signed, not encrypted)
 
     Note over BFF,RT: B · invoke
     U->>BFF: "what is on my todo list?"
@@ -82,8 +83,7 @@ sequenceDiagram
     RT->>RT: CUSTOM_JWT validates aud + scp=agent.access
 
     Note over RT,GW: C · OBO — the platform's native exchange
-    RT->>ID: GetWorkloadAccessTokenForJWT(T_user)
-    ID-->>RT: workload access token
+    RT->>RT: read the workload access token<br/>Runtime delivered in the request header
     RT->>ID: GetResourceOauth2Token(ON_BEHALF_OF_TOKEN_EXCHANGE,<br/>scopes=tools.access)
     ID->>AS1: RFC 8693 exchange as the Agent app
     AS1-->>ID: T_gateway
@@ -193,12 +193,11 @@ user is **and** *which agent* acted for them, and can require both.
 Note what is *not* on any wire: `T_id` never leaves the BFF, the agent never receives
 `T_tool`, and no token is ever placed in the model's prompt.
 
-> **This used to need two tokens.** Leg 1 originally accepted only an ID token, so the BFF
-> forwarded `T_id` in the invoke payload and the agent sent it on as `X-Okta-Id-Token`.
-> Okta's **Machine access** configuration lets leg 1 exchange an *access* token, so the
-> interceptor now uses the bearer the gateway has already validated and that whole path is
-> gone. `XAA_LEG1_SUBJECT=id_token` restores it for orgs without Machine access — see
-> [IDP_SETUP_OKTA.md](IDP_SETUP_OKTA.md) step 6.
+> **One credential reaches the gateway, not two.** Leg 1 exchanges the bearer the gateway
+> has already validated, which Okta's **Machine access** configuration authorises — so no ID
+> token travels with the request and the agent never handles one. On an org without Machine
+> access, `XAA_LEG1_SUBJECT=id_token` makes leg 1 use an ID token instead, which the BFF then
+> has to forward; see [IDP_SETUP_OKTA.md](IDP_SETUP_OKTA.md) step 6.
 
 ### Where the `act` claim appears, and where it does not
 
@@ -275,7 +274,7 @@ their exact text rather than paraphrased.
 ├─ gateway/todo-tools.json    OpenAPI for the todo target
 ├─ policies/*.cedar       per-user, per-tool authorization
 ├─ deploy/                numbered, idempotent; each writes state back to .env
-└─ scripts/               keypair, verification, the chain test, tracing
+└─ scripts/               keypair, verification, tracing
 ```
 
 ## Prerequisites
@@ -336,17 +335,6 @@ python deploy/02_create_gateway.py           # gateway, interceptor, policy engi
 python deploy/03_create_policies.py                      # Cedar
 python deploy/04_create_obo_provider.py                  # AgentCore Identity provider for hop C
 ```
-
-### Milestone: prove hop D without the agent
-
-```bash
-python scripts/test_chain.py
-```
-
-Signs you in, runs the same OBO exchange the agent runs, and calls the gateway with
-exactly what the agent sends — a single `Authorization: Bearer T_gateway`.
-A pass means the interceptor, both ID-JAG legs, the injection, Cedar and the API all
-work. `whoami` should return your email as `user` and the AI Agent as `acting_agent`.
 
 ### Deploy the agent and the BFF
 
@@ -431,50 +419,6 @@ Inspect what is deployed at any point with:
 python deploy/03_create_policies.py --list
 ```
 
-## Does ID-JAG take an access token or an ID token?
-
-Asked often enough to deserve its own heading. **Both — and which one you can use is a
-question of Okta configuration, not of the protocol.**
-
-| `subject_token` at leg 1 | Needs | Result |
-| --- | --- | --- |
-| **access token** whose `cid` is a registered caller | **Machine access** on the AI Agent | ✅ ID-JAG minted, `act` nested |
-| **ID token** from the app bound under *User access* | the **User access** binding | ✅ ID-JAG minted, `act` single-level |
-| access token with **no** matching delegation link | — | ❌ `'subject_token' is invalid: no delegation policy authorizes this token` |
-| access token whose `cid` is the **agent itself** | — | ❌ same error — an agent cannot be its own caller |
-| the caller app has no **user assignment** | — | ❌ `'subject_token' is invalid: the user is not assigned to the client application` |
-| `subject_token_type: jwt` | — | ❌ `'subject_token_type' is invalid or not supported` |
-
-Okta logs the delegation failure as `invalid_subject_token_no_delegation_link`.
-
-The underlying rule is that leg 1 needs a **delegation link** covering the token it is
-given. Two tabs create those links, and for a long time only one of them was obvious:
-
-- **User access** creates the link for the bound app's **ID token**.
-- **Machine access** creates *non-user* delegation links, which is what authorises an
-  **access token** — see [IDP_SETUP_OKTA.md](IDP_SETUP_OKTA.md) step 6. Its UI copy talks
-  about callers reaching *into* the agent, which reads like the opposite of leg 1; Okta's
-  own guide confirms these are the links that used to live under *Delegations*.
-
-**This sample uses the access token**, because that is the credential the gateway has
-already validated and handed to the interceptor. The consequences are worth stating, since
-earlier versions of this README argued the opposite:
-
-- **Nothing extra travels with the request.** No ID token in the invoke payload, no second
-  header, and the agent never handles an ID token. `scripts/test_chain.py --no-id-token`
-  proves the chain works with the header absent entirely.
-- **The provenance is richer.** The ID-JAG's `act` nests the Agent app inside the AI Agent
-  inside the user, where the ID-token path records one level. See
-  [Where the `act` claim appears, and where it does not](#where-the-act-claim-appears-and-where-it-does-not).
-- **It costs an https audience.** Machine access rejects `api://` schemes and an Okta custom
-  AS allows exactly one audience, so `AGENTCORE_AUDIENCE` must be an https URL.
-- **It needs the Okta for AI Agents subscription.** Without it, run
-  `XAA_LEG1_SUBJECT=id_token` and `SEND_ID_TOKEN=true`; that path is still tested.
-
-See [Tokens: what each one is, and where it travels](#tokens-what-each-one-is-and-where-it-travels)
-for the full inventory, including which token is on the wire at every hop and the error
-each mix-up produces.
-
 ## Tracing a request
 
 ```bash
@@ -499,7 +443,8 @@ that it is a cache hit of a few milliseconds.
 | `access_denied: Policy evaluation failed` | the agent is not in the AS 2 policy | `python deploy/00_authorize_agent.py` |
 | `invalid_client` on every call | the AI Agent is **STAGED**, or the key is staged not ACTIVE | Actions → Activate; check the ACTIVE badge on Public/private key |
 | `invalid_grant: id-jag already used` | ID-JAGs are single-use | mint one per exchange; never cache the ID-JAG (only `T_tool`) |
-| `Workload Identity does not belong to caller account` | the workload identity named in `AGENT_WORKLOAD_NAME` does not exist — the AgentCore CLI does not create it, and the message reads like a cross-account problem | `python deploy/04_create_obo_provider.py` creates it |
+| `No workload access token in context` | the agent ran outside Runtime, or the runtime has no inbound auth configured | Runtime supplies the token only with `CUSTOM_JWT` inbound. Re-run `deploy/05_patch_agentcore_json.py` and redeploy |
+| `WorkloadIdentity is linked to a service and cannot retrieve an access token by the caller` | something called `GetWorkloadAccessTokenForJWT` for a Runtime-managed identity | that call is refused by design; read the token from context instead |
 | `not authorized to perform GetResourceOauth2Token on resource: …/token-vault/default` | that action is authorized against **four** resources; naming only the credential provider is not enough, even though its ARN contains the vault as a prefix | `python deploy/06_grant_iam.py` lists all four |
 | the agent starts but has no configuration | `agentcore.json` uses **`envVars`**, an ARRAY of `{name, value}`. An `environment` map is **silently ignored** — validate passes, deploy succeeds, the runtime comes up with no variables | `python deploy/05_patch_agentcore_json.py` writes the right shape |
 | `authorizerConfiguration with customJwtAuthorizer is required` | the CLI schema spells it **`customJwtAuthorizer`**; boto3 uses `customJWTAuthorizer` | same script handles the casing |

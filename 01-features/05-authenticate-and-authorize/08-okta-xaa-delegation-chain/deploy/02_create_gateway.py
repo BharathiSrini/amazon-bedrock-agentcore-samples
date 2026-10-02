@@ -17,7 +17,10 @@ and was established against a live gateway:
     what lets the interceptor's header reach the upstream.
   * The gateway role needs GetPolicyEngine, AuthorizeAction AND
     PartiallyAuthorizeActions before CreateGateway will even succeed -- the create
-    call probes the policy engine using this role.
+    call probes the policy engine using this role. They are scoped to the policy-engine
+    and gateway ARNs rather than "*"; on the very first run the gateway does not exist
+    yet, so a gateway pattern scoped to this account and region is used, and a re-run
+    tightens it to the exact ARN.
   * `passRequestHeaders: True` is required, or the interceptor never sees the
     headers it needs.
   * exceptionLevel DEBUG makes authorizer and policy denials state a reason.
@@ -56,7 +59,6 @@ from _common import (
     save_env,
     set_log_retention,
     wait_status,
-    zip_files,
 )
 
 TARGET_NAME = "todo"
@@ -190,6 +192,23 @@ def ensure_gateway(aws, icept_arn: str, pe_id: str, mode: str, allow_user_scope:
     # CreateGateway probes the policy engine using this role, so all three
     # policy-engine actions must exist up front. Each missing one fails the create
     # with its own AccessDenied.
+    #
+    # Scoped, not "*". Per the AWS service reference, AuthorizeAction and
+    # PartiallyAuthorizeActions accept BOTH gateway and policy-engine resources, and
+    # GetPolicyEngine/GetGateway accept their own. The policy-engine ARN is known here
+    # because [3/5] runs first. The gateway ARN is not -- CreateGateway needs this role,
+    # so the gateway does not exist yet -- hence a gateway pattern narrowed to this
+    # account and region on the first run. Re-running this script after the gateway
+    # exists replaces the pattern with the exact ARN, which is why it is worth re-running
+    # once at the end of a deploy.
+    reg, acct = region(), account_id()
+    pe_arn = f"arn:aws:bedrock-agentcore:{reg}:{acct}:policy-engine/{pe_id}"
+    known_gw = env("GATEWAY_ID")
+    gw_res = (
+        f"arn:aws:bedrock-agentcore:{reg}:{acct}:gateway/{known_gw}"
+        if known_gw
+        else f"arn:aws:bedrock-agentcore:{reg}:{acct}:gateway/*"
+    )
     role = ensure_role(
         aws["iam"],
         gateway_role_name(),
@@ -199,14 +218,20 @@ def ensure_gateway(aws, icept_arn: str, pe_id: str, mode: str, allow_user_scope:
             "Statement": [
                 {"Effect": "Allow", "Action": "lambda:InvokeFunction", "Resource": icept_arn},
                 {
+                    "Sid": "PolicyEngineEvaluation",
                     "Effect": "Allow",
                     "Action": [
                         "bedrock-agentcore:GetPolicyEngine",
                         "bedrock-agentcore:AuthorizeAction",
                         "bedrock-agentcore:PartiallyAuthorizeActions",
-                        "bedrock-agentcore:GetGateway",
                     ],
-                    "Resource": "*",
+                    "Resource": [pe_arn, gw_res],
+                },
+                {
+                    "Sid": "ReadOwnGateway",
+                    "Effect": "Allow",
+                    "Action": "bedrock-agentcore:GetGateway",
+                    "Resource": gw_res,
                 },
             ],
         },
@@ -219,7 +244,7 @@ def ensure_gateway(aws, icept_arn: str, pe_id: str, mode: str, allow_user_scope:
     tools_scope = env("SCOPE_TOOLS_ACCESS", "tools.access")
     allowed_scopes = [tools_scope]
     if allow_user_scope:
-        # Pre-agent testing only: lets scripts/test_chain.py drive the gateway with a
+        # Debugging only: lets you drive the gateway with a
         # T_user straight from sign-in, before the Runtime and OBO hop exist.
         allowed_scopes.append(env("SCOPE_AGENT_ACCESS", "agent.access"))
     print(f"  allowedScopes: {allowed_scopes}")
@@ -322,10 +347,9 @@ def main() -> None:
         "--allow-user-scope",
         action="store_true",
         help=(
-            "Also accept agent.access at the gateway. No longer needed by "
-            "scripts/test_chain.py, which now performs the OBO exchange itself and sends "
-            "a tools.access token. Kept for debugging a T_user directly against the "
-            "gateway; leave it off so a replayed T_user is refused."
+            "Also accept agent.access at the gateway. Only for debugging a T_user "
+            "directly against the gateway -- the agent always presents a tools.access "
+            "token. Leave it off so a replayed T_user is refused."
         ),
     )
     args = ap.parse_args()

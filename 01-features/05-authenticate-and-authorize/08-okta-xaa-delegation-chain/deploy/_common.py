@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 import urllib.error
 import urllib.parse
@@ -175,8 +174,32 @@ class OktaAdmin:
         return self._call("DELETE", path)
 
 
-def slug(value: str) -> str:
-    return re.sub(r"[^a-z0-9-]+", "-", value.lower()).strip("-")
+def activate_as_policy(okta: OktaAdmin, as_id: str, policy_id: str, label: str = "") -> bool:
+    """Activate an authorization-server access policy and its rules, and verify.
+
+    Sending `"status": "ACTIVE"` in the create/update body does NOT work -- Okta accepts
+    the field and leaves the policy INACTIVE. Activation is a separate lifecycle call, and
+    an inactive policy is skipped silently during evaluation, so the only symptom is
+    `access_denied: Policy evaluation failed` from whichever endpoint needed it. That reads
+    like a misconfigured client or scope, which is where the time goes.
+
+    Returns True if the policy and every rule ended up ACTIVE.
+    """
+    base = f"/authorizationServers/{as_id}/policies/{policy_id}"
+    policy = okta.get(base)
+    if policy.get("status") != "ACTIVE":
+        okta.post(f"{base}/lifecycle/activate", {})
+    for rule in okta.get(f"{base}/rules"):
+        if rule.get("status") != "ACTIVE":
+            okta.post(f"{base}/rules/{rule['id']}/lifecycle/activate", {})
+    policy = okta.get(base)
+    rules = okta.get(f"{base}/rules")
+    ok = policy.get("status") == "ACTIVE" and all(r.get("status") == "ACTIVE" for r in rules)
+    if not ok:
+        print(
+            f"        ⚠ {label or policy_id} is not fully ACTIVE: policy={policy.get('status')} rules={[r.get('status') for r in rules]}"
+        )
+    return ok
 
 
 # ── Derived resource names (override in .env only if you must) ───────────────
@@ -210,11 +233,6 @@ def obo_provider_name() -> str:
     return env("AGENT_OBO_PROVIDER_NAME", "xaa-agent-obo-provider")
 
 
-def workload_name() -> str:
-    """The agent's workload identity. Must match AGENT_WORKLOAD_NAME in the runtime."""
-    return env("AGENT_WORKLOAD_NAME", "xaa-todo-agent")
-
-
 def policy_engine_name() -> str:
     # Policy engine AND policy names allow NO hyphens: the API enforces
     # ^[A-Za-z][A-Za-z0-9_]*$ (max 48). Gateway and target names do allow them, which
@@ -230,6 +248,11 @@ def region() -> str:
 
 
 def clients() -> dict:
+    # Enforce the minimum boto3 here rather than in each script: every AWS-touching step
+    # goes through clients(), and an older model fails later with a confusing
+    # ParamValidationError about an unknown parameter instead of a clear version message.
+    check_boto3()
+
     import boto3
 
     r = region()
@@ -248,20 +271,6 @@ def account_id() -> str:
     import boto3
 
     return boto3.client("sts", region_name=region()).get_caller_identity()["Account"]
-
-
-def zip_files(paths: dict[str, Path]) -> bytes:
-    """Zip {name_in_archive: source_path} with predictable permissions."""
-    import io
-    import zipfile
-
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for arcname, src in paths.items():
-            info = zipfile.ZipInfo(arcname)
-            info.external_attr = 0o644 << 16
-            z.writestr(info, src.read_text())
-    return buf.getvalue()
 
 
 def ensure_role(iam, name: str, service: str, inline: dict | None, managed: str | None) -> str:

@@ -282,6 +282,8 @@ def pick_subject_token(lower: dict) -> tuple[str | None, str, str]:
 
 
 def handler(event, context):
+    # `context` is unused: it is part of the Lambda handler signature, not something this
+    # interceptor needs.
     req = (event.get("mcp") or {}).get("gatewayRequest") or {}
     headers = dict(req.get("headers") or {})
     lower = {k.lower(): v for k, v in headers.items()}
