@@ -645,9 +645,36 @@ docker run --rm -p 8000:8000 \
     public.ecr.aws/strands/decider:latest
 ```
 
-**Option C — AWS ECS Fargate (GPU task, production):**
+**Option C — EC2 inside your VPC (recommended for Lambda access):**
 
-Deploy the container image to a Fargate task or EC2 GPU instance so the Lambda can reach it from within your VPC. Set `DECIDER_SERVER_URL` to the internal ALB or service endpoint.
+The Lambda evaluator runs inside AWS and cannot reach `localhost`. Host the server on an EC2 instance in the **same VPC** as the Lambda, using a private IP:
+
+```bash
+# Launch: Amazon Linux 2023, m5.xlarge (4 vCPU / 16 GB), same VPC as Lambda
+# On the instance (user data or SSM):
+dnf install -y python3.11 python3.11-pip
+python3.11 -m pip install strands-decider
+nohup python3.11 -m strands_decider.cli serve \
+    StrandsAgents/strands-decider-2B-hobson-v21 \
+    --host 0.0.0.0 --port 8000 > /var/log/decider.log 2>&1 &
+```
+
+Configure the Lambda:
+1. Attach `AWSLambdaVPCAccessExecutionRole` to the Lambda execution role
+2. Set the Lambda VPC to the same VPC/subnets as the EC2 instance
+3. Create a security group that allows TCP 8000 from the Lambda security group to the EC2 security group
+
+Then pass the EC2 **private** IP:
+
+```bash
+python evaluate.py \
+    --with-decider \
+    --decider-url http://<ec2-private-ip>:8000
+```
+
+**Option D — AWS ECS Fargate (GPU task, production):**
+
+Deploy the container image to a Fargate task inside your VPC. Set `DECIDER_SERVER_URL` to the internal service endpoint.
 
 #### Run with Decider
 
