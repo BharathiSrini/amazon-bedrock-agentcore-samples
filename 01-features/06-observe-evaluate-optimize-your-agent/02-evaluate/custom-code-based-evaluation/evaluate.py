@@ -439,8 +439,8 @@ for prompt in ON_DEMAND_TURNS:
     reply = _invoke_agent(prompt, ONDEMAND_SESSION_ID)
     print(f"    < {reply[:100]}")
 
-print("\n  Waiting 90s for CloudWatch log ingestion ...")
-time.sleep(90)
+print("\n  Waiting 150s for CloudWatch log ingestion ...")
+time.sleep(150)
 
 from bedrock_agentcore.evaluation import EvaluationClient  # noqa: E402
 from datetime import timedelta  # noqa: E402
@@ -633,7 +633,7 @@ _evaluator_config = EvaluatorConfig(evaluator_ids=_all_evaluator_ids)
 
 _config = EvaluationRunConfig(
     evaluator_config=_evaluator_config,
-    evaluation_delay_seconds=90,
+    evaluation_delay_seconds=150,
 )
 
 _runner = OnDemandEvaluationDatasetRunner(region=REGION)
@@ -898,11 +898,13 @@ if args.with_jev:
                 "JEV_MODEL": "jev-latest",
             },
         )
-        _add_invoke_permission("jev-evaluator")
+        # Publish a Lambda version so we can create per-evaluator aliases.
+        # AgentCore's code-based evaluator contract does NOT pass evaluatorName or
+        # evaluatorId in the Lambda event — the Lambda identifies which evaluator
+        # triggered it via context.invoked_function_arn (alias ARN, 8 colon-parts).
+        _jev_ver = lambda_client.publish_version(FunctionName="jev-evaluator")["Version"]
+        print(f"  Published Lambda version: {_jev_ver}")
 
-        # Register three evaluators, each pointing to the same Lambda ARN.
-        # AgentCore passes evaluatorName in each invocation event so the Lambda
-        # can route to the correct Jev question definition.
         JEV_EVALUATOR_DEFS = [
             ("JevGroundedness", "TRACE", 90),
             ("JevHelpfulness", "TRACE", 90),
@@ -912,6 +914,30 @@ if args.with_jev:
         jev_ids: dict[str, str] = {}
         for eval_name, eval_level, timeout_s in JEV_EVALUATOR_DEFS:
             unique_name = f"{eval_name}_{RUN_SUFFIX}"
+            # Create/update Lambda alias — the alias name becomes arn_parts[7] in the handler
+            try:
+                lambda_client.create_alias(
+                    FunctionName="jev-evaluator",
+                    Name=unique_name,
+                    FunctionVersion=_jev_ver,
+                )
+            except lambda_client.exceptions.ResourceConflictException:
+                lambda_client.update_alias(
+                    FunctionName="jev-evaluator",
+                    Name=unique_name,
+                    FunctionVersion=_jev_ver,
+                )
+            alias_arn = f"{ARN_JEV}:{unique_name}"
+            # Add invoke permission on this specific alias
+            try:
+                lambda_client.add_permission(
+                    FunctionName=f"jev-evaluator:{unique_name}",
+                    StatementId="AgentCoreInvoke",
+                    Action="lambda:InvokeFunction",
+                    Principal="bedrock-agentcore.amazonaws.com",
+                )
+            except lambda_client.exceptions.ResourceConflictException:
+                pass
             print(f"  Creating '{unique_name}' (level={eval_level}) ...")
             resp = _cp.create_evaluator(
                 evaluatorName=unique_name,
@@ -919,7 +945,7 @@ if args.with_jev:
                 evaluatorConfig={
                     "codeBased": {
                         "lambdaConfig": {
-                            "lambdaArn": ARN_JEV,
+                            "lambdaArn": alias_arn,
                             "lambdaTimeoutInSeconds": timeout_s,
                         }
                     }
@@ -939,8 +965,8 @@ if args.with_jev:
             print(f"    > {prompt[:70]}")
             _invoke_agent(prompt, JEV_SESSION_ID)
 
-        print("\n  Waiting 90s for CloudWatch log ingestion ...")
-        time.sleep(90)
+        print("\n  Waiting 150s for CloudWatch log ingestion ...")
+        time.sleep(150)
 
         jev_ec = EvaluationClient(region_name=REGION)
         jev_ec._evaluator_level_cache.update(
@@ -1055,7 +1081,12 @@ if args.with_decider:
         str(DECIDER_LAMBDAS_DIR),
         env_vars={"DECIDER_SERVER_URL": args.decider_url},
     )
-    _add_invoke_permission("strands-decider-evaluator")
+    # Publish a Lambda version so we can create per-evaluator aliases.
+    # AgentCore's code-based evaluator contract does NOT pass evaluatorName or
+    # evaluatorId in the Lambda event — the Lambda identifies which evaluator
+    # triggered it via context.invoked_function_arn (alias ARN, 8 colon-parts).
+    _decider_ver = lambda_client.publish_version(FunctionName="strands-decider-evaluator")["Version"]
+    print(f"  Published Lambda version: {_decider_ver}")
 
     DECIDER_EVALUATOR_DEFS = [
         ("DeciderGroundedness", "TRACE", 90),
@@ -1066,6 +1097,30 @@ if args.with_decider:
     decider_ids: dict[str, str] = {}
     for eval_name, eval_level, timeout_s in DECIDER_EVALUATOR_DEFS:
         unique_name = f"{eval_name}_{RUN_SUFFIX}"
+        # Create/update Lambda alias — the alias name becomes arn_parts[7] in the handler
+        try:
+            lambda_client.create_alias(
+                FunctionName="strands-decider-evaluator",
+                Name=unique_name,
+                FunctionVersion=_decider_ver,
+            )
+        except lambda_client.exceptions.ResourceConflictException:
+            lambda_client.update_alias(
+                FunctionName="strands-decider-evaluator",
+                Name=unique_name,
+                FunctionVersion=_decider_ver,
+            )
+        alias_arn = f"{ARN_DECIDER}:{unique_name}"
+        # Add invoke permission on this specific alias
+        try:
+            lambda_client.add_permission(
+                FunctionName=f"strands-decider-evaluator:{unique_name}",
+                StatementId="AgentCoreInvoke",
+                Action="lambda:InvokeFunction",
+                Principal="bedrock-agentcore.amazonaws.com",
+            )
+        except lambda_client.exceptions.ResourceConflictException:
+            pass
         print(f"  Creating '{unique_name}' (level={eval_level}) ...")
         resp = _cp.create_evaluator(
             evaluatorName=unique_name,
@@ -1073,7 +1128,7 @@ if args.with_decider:
             evaluatorConfig={
                 "codeBased": {
                     "lambdaConfig": {
-                        "lambdaArn": ARN_DECIDER,
+                        "lambdaArn": alias_arn,
                         "lambdaTimeoutInSeconds": timeout_s,
                     }
                 }
@@ -1094,8 +1149,8 @@ if args.with_decider:
         print(f"    > {prompt[:70]}")
         _invoke_agent(prompt, DECIDER_SESSION_ID)
 
-    print("\n  Waiting 90s for CloudWatch log ingestion ...")
-    time.sleep(90)
+    print("\n  Waiting 150s for CloudWatch log ingestion ...")
+    time.sleep(150)
 
     decider_ec = EvaluationClient(region_name=REGION)
     decider_ec._evaluator_level_cache.update(

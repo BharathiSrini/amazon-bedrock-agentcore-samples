@@ -41,11 +41,15 @@ import json
 import logging
 import os
 import random
+import re
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+# Strip run-suffix added by evaluate.py (e.g. "DeciderGroundedness_5488c641" → "DeciderGroundedness")
+_SUFFIX_RE = re.compile(r"_[0-9a-f]{8}$")
 
 from spans import Turn, build_turns
 
@@ -206,11 +210,13 @@ def _interpret(definition: dict[str, Any], answer: dict[str, Any], model: str) -
 
 def _evaluator_name(event: dict[str, Any], context: Any) -> str:
     if event.get("evaluatorName"):
-        return event["evaluatorName"]
+        return _SUFFIX_RE.sub("", event["evaluatorName"])
     if event.get("evaluatorId"):
-        return event["evaluatorId"].rsplit("/", 1)[-1].rsplit("-", 1)[0]
+        name = event["evaluatorId"].rsplit("/", 1)[-1].rsplit("-", 1)[0]
+        return _SUFFIX_RE.sub("", name)
     arn_parts = (getattr(context, "invoked_function_arn", "") or "").split(":")
-    return arn_parts[7] if len(arn_parts) == 8 else ""
+    raw = arn_parts[7] if len(arn_parts) == 8 else ""
+    return _SUFFIX_RE.sub("", raw)
 
 
 # ---------------------------------------------------------------------------

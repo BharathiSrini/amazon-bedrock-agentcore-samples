@@ -12,8 +12,12 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any
+
+# Strip run-suffix added by evaluate.py (e.g. "JevGroundedness_5488c641" → "JevGroundedness")
+_SUFFIX_RE = re.compile(r"_[0-9a-f]{8}$")
 
 import jev
 from spans import Turn, build_turns
@@ -118,19 +122,24 @@ def interpret(definition: dict[str, Any], answer: dict[str, Any], model: str) ->
 
 
 def _evaluator_name(event: dict[str, Any], context: Any) -> str:
-    """Return the name of the evaluator being run.
+    """Return the base evaluator name (without run suffix) for DEFINITIONS lookup.
 
-    The documented contract carries ``evaluatorName`` and ``evaluatorId`` (the
-    name plus a generated suffix, such as ``JevGroundedness-a1B2c3D4e5``), but
-    the service currently omits both. Each evaluator therefore targets a
-    Lambda alias named after it, and the alias is the fallback.
+    The evaluate.py script appends a ``_{8-hex}`` run suffix to avoid
+    ConflictException on re-runs (e.g. ``JevGroundedness_5488c641``). Strip
+    it before looking up in DEFINITIONS which uses bare names.
+
+    The documented contract also carries ``evaluatorId`` (the name plus an
+    AgentCore-generated suffix such as ``JevGroundedness_5488c641-a1B2c3D4e5``),
+    and the Lambda function alias as a final fallback.
     """
     if event.get("evaluatorName"):
-        return event["evaluatorName"]
+        return _SUFFIX_RE.sub("", event["evaluatorName"])
     if event.get("evaluatorId"):
-        return event["evaluatorId"].rsplit("/", 1)[-1].rsplit("-", 1)[0]
+        name = event["evaluatorId"].rsplit("/", 1)[-1].rsplit("-", 1)[0]
+        return _SUFFIX_RE.sub("", name)
     arn_parts = (getattr(context, "invoked_function_arn", "") or "").split(":")
-    return arn_parts[7] if len(arn_parts) == 8 else ""
+    raw = arn_parts[7] if len(arn_parts) == 8 else ""
+    return _SUFFIX_RE.sub("", raw)
 
 
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
