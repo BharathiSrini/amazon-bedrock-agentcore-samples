@@ -22,11 +22,20 @@ evaluation run.
 
 Usage:
     python evaluate.py [--region REGION] [--config PATH]
+                       [--with-jev --jev-secret-arn ARN]
+                       [--with-decider [--decider-url URL | --decider-ec2]]
 
 Args:
-    --region    AWS region (default: from agent_config.json or boto3 session)
-    --config    Path to agent_config.json written by deploy.py
-                (default: ../utils/agent_config.json)
+    --region        AWS region (default: from agent_config.json or boto3 session)
+    --config        Path to agent_config.json written by deploy.py
+                    (default: ../utils/agent_config.json)
+    --with-jev      Deploy Jev decision-model evaluators (requires --jev-secret-arn)
+    --with-decider  Deploy Strands Decider evaluators
+    --decider-url   URL of a running Decider server reachable from the Lambda
+    --decider-ec2   Auto-provision an EC2 instance (m5.xlarge, AL2023) in the
+                    default VPC, configure the Lambda in the same VPC, and poll
+                    until the Decider server is ready. Mutually exclusive with
+                    --decider-url (URL is derived automatically from EC2 private IP).
 
 Prerequisites:
     1. Deploy the HR Assistant agent:
@@ -94,7 +103,22 @@ parser.add_argument(
 parser.add_argument(
     "--decider-url",
     default="http://localhost:8000",
-    help="URL of the running Strands Decider server, e.g. http://<host>:8000 (required when --with-decider is set)",
+    help=(
+        "URL of a running Strands Decider server reachable from the Lambda, "
+        "e.g. http://<private-ip>:8000. Ignored when --decider-ec2 is set."
+    ),
+)
+parser.add_argument(
+    "--decider-ec2",
+    action="store_true",
+    default=False,
+    help=(
+        "Auto-provision an EC2 instance (m5.xlarge, AL2023) in the default VPC "
+        "to host the Strands Decider server. Configures the Lambda in the same VPC "
+        "and polls until the model is loaded and the server is ready (~5-10 min on "
+        "first run). When set, --decider-url is derived automatically from the "
+        "EC2 private IP and does not need to be specified."
+    ),
 )
 args = parser.parse_args()
 
@@ -1014,20 +1038,20 @@ if args.with_jev:
 # Conversation turns are serialized to plain text before sending to the server,
 # since Strands Decider operates on text state rather than structured JSON.
 #
-# Start the server before running this script:
+# Option A — bring your own server (reachable from the Lambda via private IP):
 #   pip install strands-decider
-#   strands-decider serve StrandsAgents/strands-decider-2B-hobson-v21 --port 8000
+#   python3 -m strands_decider.cli serve StrandsAgents/strands-decider-2B-hobson-v21 \
+#       --host 0.0.0.0 --port 8000
+#   python evaluate.py --with-decider --decider-url http://<private-ip>:8000
 #
-# Or via Docker:
-#   docker run --rm -p 8000:8000 \
-#       -e MODEL=StrandsAgents/strands-decider-2B-hobson-v21 \
-#       public.ecr.aws/strands/decider:latest
-#
-# Then pass the URL: python evaluate.py --with-decider --decider-url http://<host>:8000
+# Option B — auto-provision EC2 (recommended, no manual steps):
+#   python evaluate.py --with-decider --decider-ec2
+#   Launches an m5.xlarge AL2023 instance in your default VPC, installs
+#   strands-decider, configures the Lambda in the same VPC, and polls
+#   until the model is loaded (~5-10 min on first run; fast on reuse).
 
 if args.with_decider:
     print("\n[7/7] Deploying and registering Strands Decider evaluators ...")
-    print(f"  Decider server : {args.decider_url}")
 
     DECIDER_LAMBDAS_DIR = LAMBDAS_DIR / "strands_decider_evaluator"
 
@@ -1056,6 +1080,8 @@ if args.with_decider:
                     FunctionName=function_name,
                     Environment={"Variables": env_vars},
                 )
+                waiter = lambda_client.get_waiter("function_updated_v2")
+                waiter.wait(FunctionName=function_name)
                 arn = resp["Configuration"]["FunctionArn"]
             except lambda_client.exceptions.ResourceNotFoundException:
                 print("  Creating new function ...")
@@ -1076,11 +1102,300 @@ if args.with_decider:
             print(f"  ARN: {arn}")
             return arn
 
+    # ----------------------------------------------------------------
+    # Optional: auto-provision EC2 instance for Strands Decider server
+    # ----------------------------------------------------------------
+    _lambda_vpc_config = None
+    _decider_instance_id = None
+
+    if args.decider_ec2:
+        import base64  # noqa: PLC0415
+
+        ec2_client = boto3.client("ec2", region_name=REGION)
+        ssm_client = boto3.client("ssm", region_name=REGION)
+
+        print("\n  Provisioning EC2 Decider server (--decider-ec2) ...")
+
+        # --- 1. Default VPC and subnets ---
+        _vpcs = ec2_client.describe_vpcs(
+            Filters=[{"Name": "isDefault", "Values": ["true"]}]
+        )["Vpcs"]
+        if not _vpcs:
+            print("  ERROR: No default VPC found. Create one or pass --decider-url manually.")
+            sys.exit(1)
+        _ec2_vpc_id = _vpcs[0]["VpcId"]
+        print(f"  VPC: {_ec2_vpc_id}")
+
+        _ec2_subnets = ec2_client.describe_subnets(
+            Filters=[
+                {"Name": "vpc-id", "Values": [_ec2_vpc_id]},
+                {"Name": "state", "Values": ["available"]},
+            ]
+        )["Subnets"]
+        _ec2_subnet_ids = [s["SubnetId"] for s in _ec2_subnets]
+        _ec2_launch_subnet = _ec2_subnet_ids[0]
+
+        # --- 2. Security groups ---
+        def _get_or_create_sg(sg_name: str, description: str) -> str:
+            existing = ec2_client.describe_security_groups(
+                Filters=[
+                    {"Name": "group-name", "Values": [sg_name]},
+                    {"Name": "vpc-id", "Values": [_ec2_vpc_id]},
+                ]
+            )["SecurityGroups"]
+            if existing:
+                _id = existing[0]["GroupId"]
+                print(f"  Reusing SG {sg_name}: {_id}")
+                return _id
+            _resp = ec2_client.create_security_group(
+                GroupName=sg_name, Description=description, VpcId=_ec2_vpc_id
+            )
+            _id = _resp["GroupId"]
+            ec2_client.create_tags(Resources=[_id], Tags=[{"Key": "Name", "Value": sg_name}])
+            print(f"  Created SG {sg_name}: {_id}")
+            return _id
+
+        _lambda_sg_id = _get_or_create_sg(
+            "DeciderLambdaSG", "Outbound SG for Lambda calling Strands Decider"
+        )
+        _server_sg_id = _get_or_create_sg(
+            "DeciderServerSG", "Inbound SG for Strands Decider EC2 server"
+        )
+
+        # Allow TCP 8000 from Lambda SG into Server SG (idempotent)
+        try:
+            ec2_client.authorize_security_group_ingress(
+                GroupId=_server_sg_id,
+                IpPermissions=[{
+                    "IpProtocol": "tcp",
+                    "FromPort": 8000,
+                    "ToPort": 8000,
+                    "UserIdGroupPairs": [{"GroupId": _lambda_sg_id}],
+                }],
+            )
+            print(f"  Allowed TCP 8000 from {_lambda_sg_id} → {_server_sg_id}")
+        except Exception as _sg_err:
+            if "InvalidPermission.Duplicate" not in str(_sg_err):
+                raise
+
+        # --- 3. IAM instance profile for EC2 (SSM access) ---
+        _ec2_role_name = "DeciderServerRole"
+        _ec2_profile_name = "DeciderServerInstanceProfile"
+        _ec2_trust = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": {"Service": "ec2.amazonaws.com"},
+                "Action": "sts:AssumeRole",
+            }],
+        })
+        try:
+            iam_client.get_role(RoleName=_ec2_role_name)
+            print(f"  Reusing IAM role: {_ec2_role_name}")
+        except iam_client.exceptions.NoSuchEntityException:
+            iam_client.create_role(
+                RoleName=_ec2_role_name,
+                AssumeRolePolicyDocument=_ec2_trust,
+                Description="EC2 role for Strands Decider server (SSM + HuggingFace download)",
+            )
+            iam_client.attach_role_policy(
+                RoleName=_ec2_role_name,
+                PolicyArn="arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
+            )
+            print(f"  Created IAM role: {_ec2_role_name}")
+
+        try:
+            _prof = iam_client.get_instance_profile(InstanceProfileName=_ec2_profile_name)
+            _ec2_profile_arn = _prof["InstanceProfile"]["Arn"]
+            print(f"  Reusing instance profile: {_ec2_profile_arn}")
+        except iam_client.exceptions.NoSuchEntityException:
+            _prof = iam_client.create_instance_profile(InstanceProfileName=_ec2_profile_name)
+            _ec2_profile_arn = _prof["InstanceProfile"]["Arn"]
+            iam_client.add_role_to_instance_profile(
+                InstanceProfileName=_ec2_profile_name, RoleName=_ec2_role_name
+            )
+            print(f"  Created instance profile: {_ec2_profile_arn}")
+            print("  Waiting 15s for IAM instance profile propagation ...")
+            time.sleep(15)
+
+        # --- 4. Find or launch EC2 instance ---
+        _existing_reservations = ec2_client.describe_instances(
+            Filters=[
+                {"Name": "tag:Name", "Values": ["DeciderServer"]},
+                {"Name": "instance-state-name",
+                 "Values": ["pending", "running", "stopping", "stopped"]},
+            ]
+        )["Reservations"]
+
+        if _existing_reservations:
+            _inst = _existing_reservations[0]["Instances"][0]
+            _decider_instance_id = _inst["InstanceId"]
+            _inst_state = _inst["State"]["Name"]
+            print(f"  Found existing EC2: {_decider_instance_id} (state={_inst_state})")
+            if _inst_state == "stopping":
+                print("  Waiting for stopped state before restarting ...")
+                ec2_client.get_waiter("instance_stopped").wait(
+                    InstanceIds=[_decider_instance_id]
+                )
+                _inst_state = "stopped"
+            if _inst_state == "stopped":
+                ec2_client.start_instances(InstanceIds=[_decider_instance_id])
+                print("  Starting stopped instance ...")
+            ec2_client.get_waiter("instance_running").wait(
+                InstanceIds=[_decider_instance_id]
+            )
+        else:
+            # Resolve latest AL2023 x86_64 AMI from SSM Parameter Store
+            _ami_id = ssm_client.get_parameter(
+                Name="/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
+            )["Parameter"]["Value"]
+            print(f"  Launching EC2 (AMI={_ami_id}, type=m5.xlarge) ...")
+
+            # User data: install Python 3.11 + strands-decider, start server
+            _user_data_script = b"""#!/bin/bash
+set -e
+dnf install -y python3.11 python3.11-pip
+python3.11 -m pip install strands-decider
+nohup python3.11 -m strands_decider.cli serve \\
+    StrandsAgents/strands-decider-2B-hobson-v21 \\
+    --host 0.0.0.0 --port 8000 \\
+    > /var/log/decider.log 2>&1 &
+disown
+"""
+            _run_resp = ec2_client.run_instances(
+                ImageId=_ami_id,
+                InstanceType="m5.xlarge",
+                MinCount=1,
+                MaxCount=1,
+                SubnetId=_ec2_launch_subnet,
+                SecurityGroupIds=[_server_sg_id],
+                IamInstanceProfile={"Arn": _ec2_profile_arn},
+                UserData=base64.b64encode(_user_data_script).decode(),
+                TagSpecifications=[{
+                    "ResourceType": "instance",
+                    "Tags": [{"Key": "Name", "Value": "DeciderServer"}],
+                }],
+            )
+            _decider_instance_id = _run_resp["Instances"][0]["InstanceId"]
+            print(f"  Launched: {_decider_instance_id}. Waiting for running state ...")
+            ec2_client.get_waiter("instance_running").wait(
+                InstanceIds=[_decider_instance_id]
+            )
+
+        _inst_desc = ec2_client.describe_instances(InstanceIds=[_decider_instance_id])
+        _decider_private_ip = (
+            _inst_desc["Reservations"][0]["Instances"][0]["PrivateIpAddress"]
+        )
+        print(f"  EC2 private IP: {_decider_private_ip}")
+        args.decider_url = f"http://{_decider_private_ip}:8000"
+        print(f"  Decider server URL: {args.decider_url}")
+
+        # --- 5. Ensure Lambda role has VPC execution permissions ---
+        try:
+            iam_client.attach_role_policy(
+                RoleName=LAMBDA_ROLE_NAME,
+                PolicyArn="arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole",
+            )
+            print("  Attached AWSLambdaVPCAccessExecutionRole to Lambda role")
+        except Exception as _vpc_policy_err:
+            if "already been attached" in str(_vpc_policy_err):
+                print("  AWSLambdaVPCAccessExecutionRole already attached")
+            else:
+                raise
+
+        _lambda_vpc_config = {
+            "SubnetIds": _ec2_subnet_ids,
+            "SecurityGroupIds": [_lambda_sg_id],
+        }
+
+    print(f"  Decider server : {args.decider_url}")
+
+    # Deploy Lambda with DECIDER_SERVER_URL pointing at the server
     ARN_DECIDER = _deploy_lambda_lightweight(
         "strands-decider-evaluator",
         str(DECIDER_LAMBDAS_DIR),
         env_vars={"DECIDER_SERVER_URL": args.decider_url},
     )
+
+    # Configure Lambda VPC so it can reach the EC2 private IP
+    if args.decider_ec2 and _lambda_vpc_config:
+        print("  Configuring Lambda VPC and extending timeout to 240s ...")
+        lambda_client.update_function_configuration(
+            FunctionName="strands-decider-evaluator",
+            VpcConfig=_lambda_vpc_config,
+            Timeout=240,
+        )
+        lambda_client.get_waiter("function_updated_v2").wait(
+            FunctionName="strands-decider-evaluator"
+        )
+        print("  Lambda VPC configured.")
+
+        # Poll Strands Decider server readiness via SSM
+        # (first run: model download takes ~5-10 min; reuse is fast)
+        print(f"\n  Waiting for Strands Decider server on {_decider_instance_id} ...")
+        print("  (first run: model download ~5-10 min; subsequent starts are fast)")
+
+        # Step A: wait for SSM agent to register
+        _ssm_agent_ready = False
+        for _i in range(36):  # up to 6 min
+            try:
+                _ssm_info = ssm_client.describe_instance_information(
+                    Filters=[{"Key": "InstanceIds", "Values": [_decider_instance_id]}]
+                )["InstanceInformationList"]
+                if _ssm_info and _ssm_info[0].get("PingStatus") == "Online":
+                    print("  SSM agent online.")
+                    _ssm_agent_ready = True
+                    break
+            except Exception:
+                pass
+            print(f"  Waiting for SSM agent ({_i + 1}/36) ...")
+            time.sleep(10)
+
+        if not _ssm_agent_ready:
+            print("  WARNING: SSM agent not available; skipping server health check.")
+            print("  Proceeding — Lambda will retry on first evaluation call.")
+        else:
+            # Step B: poll server health via SSM until ready or timeout
+            _poll_deadline = time.time() + 720  # 12 min
+            _poll_attempt = 0
+            _server_ready = False
+            while time.time() < _poll_deadline:
+                _poll_attempt += 1
+                try:
+                    _cmd = ssm_client.send_command(
+                        InstanceIds=[_decider_instance_id],
+                        DocumentName="AWS-RunShellScript",
+                        Parameters={"commands": [
+                            "curl -sf -m 15 -X POST http://localhost:8000/v1/systemone "
+                            "-H 'Content-Type: application/json' "
+                            "-d '{\"state\":\"ping\",\"questions\":{"
+                            "\"ping\":{\"type\":\"noul\",\"definition\":\"Is this a test?\"}}}'"
+                            " > /dev/null && echo READY"
+                        ]},
+                    )
+                    _cmd_id = _cmd["Command"]["CommandId"]
+                    time.sleep(20)  # give the command time to run
+                    _inv = ssm_client.get_command_invocation(
+                        CommandId=_cmd_id, InstanceId=_decider_instance_id
+                    )
+                    if _inv.get("Status") == "Success" and "READY" in (
+                        _inv.get("StandardOutputContent") or ""
+                    ):
+                        print(f"  Strands Decider server is ready! (attempt {_poll_attempt})")
+                        _server_ready = True
+                        break
+                    _status = _inv.get("Status", "unknown")
+                    print(f"  Server not ready (attempt {_poll_attempt}, status={_status}) ...")
+                except Exception as _poll_err:
+                    print(f"  Poll attempt {_poll_attempt} error: {_poll_err}")
+                time.sleep(15)
+
+            if not _server_ready:
+                print(
+                    "  WARNING: Server health check timed out. "
+                    "Proceeding — Lambda will retry automatically."
+                )
+
     # Publish a Lambda version so we can create per-evaluator aliases.
     # AgentCore's code-based evaluator contract does NOT pass evaluatorName or
     # evaluatorId in the Lambda event — the Lambda identifies which evaluator

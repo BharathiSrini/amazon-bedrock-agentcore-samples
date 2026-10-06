@@ -485,7 +485,7 @@ You can extend the dataset with additional scenarios to test more HR topics (rem
 | 4 | (always) | On-demand evaluation — invoke HR assistant, run `EvaluationClient` (code-based + built-in), then `OnDemandEvaluationDatasetRunner` with 5 scenarios |
 | 5 | (always) | Online evaluation — create `online_evaluation_config` with code-based evaluators; auto-triggered on all new sessions |
 | 6 | `--with-jev` | Deploy `jev-evaluator` Lambda, register three Jev evaluators, run on-demand eval |
-| 7 | `--with-decider` | Deploy `strands-decider-evaluator` Lambda, register three Decider evaluators, run on-demand eval |
+| 7 | `--with-decider` | Deploy `strands-decider-evaluator` Lambda, register three Decider evaluators, run on-demand eval. Add `--decider-ec2` to auto-provision an EC2 instance and configure Lambda VPC automatically |
 
 ---
 
@@ -649,13 +649,27 @@ docker run --rm -p 8000:8000 \
     public.ecr.aws/strands/decider:latest
 ```
 
-**Option C — EC2 inside your VPC (recommended for Lambda access):**
+**Option C — auto-provision EC2 in your VPC (recommended, zero manual steps):**
 
-The Lambda evaluator runs inside AWS and cannot reach `localhost`. Host the server on an EC2 instance in the **same VPC** as the Lambda, using a private IP:
+Pass `--decider-ec2` and `evaluate.py` handles everything automatically:
 
 ```bash
-# Launch: Amazon Linux 2023, m5.xlarge (4 vCPU / 16 GB), same VPC as Lambda
-# On the instance (user data or SSM):
+python evaluate.py --with-decider --decider-ec2
+```
+
+What it does:
+1. Creates security groups `DeciderLambdaSG` (Lambda outbound) and `DeciderServerSG` (EC2 inbound TCP 8000) in your default VPC — idempotent, reused on subsequent runs
+2. Creates IAM role `DeciderServerRole` with `AmazonSSMManagedInstanceCore` and an instance profile — idempotent
+3. Launches (or reuses) an EC2 instance tagged `DeciderServer` (m5.xlarge, latest AL2023, user data installs Python 3.11 + strands-decider and starts the server); if a stopped instance is found it is restarted
+4. Attaches `AWSLambdaVPCAccessExecutionRole` to the Lambda execution role — idempotent
+5. Configures the Lambda VPC (same VPC, all subnets, `DeciderLambdaSG`) and extends Lambda timeout to 240 s
+6. Polls via SSM until the Strands Decider server passes a health check (first run ~5–10 min for model download; subsequent starts are fast)
+7. Sets `DECIDER_SERVER_URL` to `http://<ec2-private-ip>:8000` automatically
+
+**Option D — bring your own server (any host reachable from the Lambda via private IP):**
+
+```bash
+# On the server (AL2023 example):
 dnf install -y python3.11 python3.11-pip
 python3.11 -m pip install strands-decider
 nohup python3.11 -m strands_decider.cli serve \
@@ -663,29 +677,26 @@ nohup python3.11 -m strands_decider.cli serve \
     --host 0.0.0.0 --port 8000 > /var/log/decider.log 2>&1 &
 ```
 
-Configure the Lambda:
-1. Attach `AWSLambdaVPCAccessExecutionRole` to the Lambda execution role
-2. Set the Lambda VPC to the same VPC/subnets as the EC2 instance
-3. Create a security group that allows TCP 8000 from the Lambda security group to the EC2 security group
-
-Then pass the EC2 **private** IP:
+Then pass the private IP (Lambda must be in the same VPC or have a route to the server):
 
 ```bash
 python evaluate.py \
     --with-decider \
-    --decider-url http://<ec2-private-ip>:8000
+    --decider-url http://<private-ip>:8000
 ```
 
-**Option D — AWS ECS Fargate (GPU task, production):**
+**Option E — AWS ECS Fargate (GPU task, production):**
 
 Deploy the container image to a Fargate task inside your VPC. Set `DECIDER_SERVER_URL` to the internal service endpoint.
 
 #### Run with Decider
 
 ```bash
-python evaluate.py \
-    --with-decider \
-    --decider-url http://<your-decider-host>:8000
+# Recommended — auto-provision EC2 (no manual server setup):
+python evaluate.py --with-decider --decider-ec2
+
+# Bring-your-own server already running in the VPC:
+python evaluate.py --with-decider --decider-url http://<private-ip>:8000
 ```
 
 #### Lambda Architecture
