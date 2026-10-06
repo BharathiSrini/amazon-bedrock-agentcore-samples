@@ -1362,15 +1362,17 @@ disown
             while time.time() < _poll_deadline:
                 _poll_attempt += 1
                 try:
+                    # Use a temp file for the JSON body to avoid shell quoting issues
                     _cmd = ssm_client.send_command(
                         InstanceIds=[_decider_instance_id],
                         DocumentName="AWS-RunShellScript",
                         Parameters={"commands": [
+                            "printf '%s' "
+                            '\'{"state":"ping","questions":{"ping":{"type":"noul","definition":"test"}}}\''
+                            " > /tmp/decider_ping.json && "
                             "curl -sf -m 15 -X POST http://localhost:8000/v1/systemone "
                             "-H 'Content-Type: application/json' "
-                            "-d '{\"state\":\"ping\",\"questions\":{"
-                            "\"ping\":{\"type\":\"noul\",\"definition\":\"Is this a test?\"}}}'"
-                            " > /dev/null && echo READY"
+                            "-d @/tmp/decider_ping.json > /dev/null && echo READY"
                         ]},
                     )
                     _cmd_id = _cmd["Command"]["CommandId"]
