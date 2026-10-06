@@ -473,13 +473,15 @@ You can extend the dataset with additional scenarios to test more HR topics (rem
 
 ## Script Walkthrough
 
-| Step | Description |
-|---|---|
-| 1 | Lambda execution role — create (or reuse) `AgentCoreLambdaEvaluatorRole` |
-| 2 | Package and deploy Lambda functions (`hr-response-length`, `hr-fact-checker`) with bedrock-agentcore SDK bundled |
-| 3 | Register evaluators via `bedrock-agentcore-control` boto3 service |
-| 4 | On-demand evaluation — invoke HR assistant, run `EvaluationClient` (code-based + built-in), then `OnDemandEvaluationDatasetRunner` with 5 scenarios |
-| 5 | Online evaluation — create `online_evaluation_config` with code-based evaluators; auto-triggered on all new sessions |
+| Step | Flag | Description |
+|---|---|---|
+| 1 | (always) | Lambda execution role — create (or reuse) `AgentCoreLambdaEvaluatorRole` |
+| 2 | (always) | Package and deploy Lambda functions (`hr-response-length`, `hr-fact-checker`) with bedrock-agentcore SDK bundled |
+| 3 | (always) | Register evaluators via `bedrock-agentcore-control` boto3 service |
+| 4 | (always) | On-demand evaluation — invoke HR assistant, run `EvaluationClient` (code-based + built-in), then `OnDemandEvaluationDatasetRunner` with 5 scenarios |
+| 5 | (always) | Online evaluation — create `online_evaluation_config` with code-based evaluators; auto-triggered on all new sessions |
+| 6 | `--with-jev` | Deploy `jev-evaluator` Lambda, register three Jev evaluators, run on-demand eval |
+| 7 | `--with-decider` | Deploy `strands-decider-evaluator` Lambda, register three Decider evaluators, run on-demand eval |
 
 ---
 
@@ -519,4 +521,219 @@ Code-based evaluators are supported for **both on-demand** (`EvaluationClient`, 
 - Combine code-based evaluators with `EvaluationClient` to validate specific production sessions
 - Add code-based evaluators to your CI/CD pipeline for zero-cost regression testing on every deployment
 - Use online evaluation with a lower sampling rate (e.g. 10%) to cost-effectively monitor high-traffic agents
+- Try `--with-jev` or `--with-decider` to add a calibrated decision model to your evaluation mix
 - Explore [`ground-truth-based-evaluation/`](../ground-truth-based-evaluation/) for `EvaluationClient` and ground-truth-based evaluations with built-in evaluators
+
+---
+
+## Decision-Model Evaluators
+
+Beyond deterministic code and probabilistic LLM-as-a-judge, a third option is a **decision model** — a small, specialized model (≤2B parameters) trained specifically to select from a fixed set of options and return calibrated confidence scores. Decision models are faster than full LLMs, cheaper to run, and produce well-calibrated probabilities that map cleanly to `value` scores.
+
+This sample supports two interchangeable decision-model backends:
+
+| | Jev | Strands Decider |
+|---|---|---|
+| **Hosting** | Cloud API (TypeSafe) | Self-hosted |
+| **Auth** | API key via Secrets Manager | None (your own server) |
+| **Data egress** | Sent to TypeSafe API | Stays in your VPC |
+| **Latency** | ~115 ms (cloud) | ~115 ms on RTX 3090 / ~153 ms on M3 |
+| **Flag** | `--with-jev` | `--with-decider` |
+
+Both backends use the same `/v1/systemone` HTTP endpoint format and return identical response schemas, so you can swap between them without changing the evaluator definitions.
+
+---
+
+### Jev Evaluators (`--with-jev`)
+
+[Jev](https://typesafe.ai) is a hosted decision model served at `https://api.typesafe.ai/v1/systemone`. It accepts a structured JSON `state` (conversation turns with tool calls) and a set of questions, then returns probability-weighted answers.
+
+#### Setup
+
+1. Obtain a Jev API key from TypeSafe.
+2. Store it in AWS Secrets Manager:
+
+   ```bash
+   aws secretsmanager create-secret \
+       --name jev/api-key \
+       --secret-string "sk-jev-XXXXXXXXXXXX"
+   ```
+
+3. Run with the secret ARN:
+
+   ```bash
+   python evaluate.py \
+       --with-jev \
+       --jev-secret-arn arn:aws:secretsmanager:<region>:<account>:secret:jev/api-key
+   ```
+
+#### Lambda Architecture
+
+A single Lambda function (`jev-evaluator`) handles all three evaluators. AgentCore passes the evaluator name in each invocation event; the Lambda looks up the matching Jev question in `evaluators.json` and routes accordingly. No aliases required — one Lambda ARN is registered three times under different evaluator names.
+
+```
+AgentCore Evaluations DP
+  │
+  ├── JevGroundedness (TRACE)   ──┐
+  ├── JevHelpfulness  (TRACE)   ──┤──→ jev-evaluator Lambda ──→ Jev API (TypeSafe)
+  └── JevGoalCompletion (SESSION)─┘
+```
+
+**Lambda source:** `lambdas/jev_evaluator/`
+
+| File | Purpose |
+|---|---|
+| `lambda_function.py` | Entry point — re-exports `handler.handler` as `lambda_handler` |
+| `handler.py` | Reconstructs turns from OTel spans, builds structured Jev state, interprets answers |
+| `jev.py` | Jev API client with exponential-backoff retries and Secrets Manager key cache |
+| `spans.py` | Parses the mixed span/log-record format AgentCore sends to the Lambda |
+| `evaluators.json` | Defines questions for all three evaluators (noul / score / choice) |
+
+#### Evaluators
+
+| Evaluator | Level | Question type | What it checks |
+|---|---|---|---|
+| `JevGroundedness` | TRACE | `noul` | Every factual claim in the response is supported by tool results |
+| `JevHelpfulness` | TRACE | `score` | How far the response moves the employee toward their goal (4-level rubric) |
+| `JevGoalCompletion` | SESSION | `choice` | Were all employee goals achieved by session end? |
+
+**State format:** Jev receives a structured dict — `{"previous_turns": [...], "current_turn": {...}}` for TRACE or `{"turns": [...]}` for SESSION — preserving tool call inputs and outputs as typed objects.
+
+#### Jev Question Types
+
+```json
+// noul — binary yes/no, returns P(true) in [0, 1]
+{"type": "noul", "instructions": "...", "criteria": {"true": "...", "false": "..."}}
+
+// score — ordinal rubric, returns expected level normalized to [0, 1]
+{"type": "score", "instructions": "...", "criteria": ["level-0 desc", "level-1 desc", ...]}
+
+// choice — named options, returns probability-weighted value
+{"type": "choice", "instructions": "...", "criteria": {"option_a": "...", "option_b": "..."}}
+```
+
+#### AgentCore CLI
+
+```bash
+# Register a Jev-backed evaluator via CLI
+agentcore add evaluator \
+  --name JevGroundedness \
+  --level TRACE \
+  --type code-based \
+  --lambda-arn arn:aws:lambda:<region>:<account>:function:jev-evaluator \
+  --timeout 90
+```
+
+---
+
+### Strands Decider Evaluators (`--with-decider`)
+
+[Strands Decider 2B](https://strandsagents.com/blog/introducing-strands-decider/) is an open-source, 2-billion-parameter decision model you host yourself. It exposes the same `/v1/systemone` HTTP endpoint as Jev, making it a drop-in self-hosted alternative with no API key and no data leaving your environment.
+
+#### Start the server
+
+**Option A — pip:**
+```bash
+pip install strands-decider
+strands-decider serve StrandsAgents/strands-decider-2B-hobson-v21 --port 8000
+```
+
+**Option B — Docker:**
+```bash
+docker run --rm -p 8000:8000 \
+    -e MODEL=StrandsAgents/strands-decider-2B-hobson-v21 \
+    public.ecr.aws/strands/decider:latest
+```
+
+**Option C — AWS ECS Fargate (GPU task, production):**
+
+Deploy the container image to a Fargate task or EC2 GPU instance so the Lambda can reach it from within your VPC. Set `DECIDER_SERVER_URL` to the internal ALB or service endpoint.
+
+#### Run with Decider
+
+```bash
+python evaluate.py \
+    --with-decider \
+    --decider-url http://<your-decider-host>:8000
+```
+
+#### Lambda Architecture
+
+```
+AgentCore Evaluations DP
+  │
+  ├── DeciderGroundedness (TRACE)    ──┐
+  ├── DeciderHelpfulness  (TRACE)    ──┤──→ strands-decider-evaluator Lambda ──→ Decider server
+  └── DeciderGoalCompletion (SESSION) ─┘         (self-hosted, DECIDER_SERVER_URL)
+```
+
+**Lambda source:** `lambdas/strands_decider_evaluator/`
+
+| File | Purpose |
+|---|---|
+| `lambda_function.py` | Self-contained handler — serializes turns to text, calls Decider server, interprets answers |
+| `spans.py` | Same span parser as the Jev evaluator (shared copy) |
+| `evaluators.json` | Defines questions for all three evaluators |
+
+The Lambda packages no external dependencies — it uses only the Python standard library, which keeps the zip under 50 KB and cold-start time under 200 ms.
+
+#### State serialization
+
+Unlike Jev (which accepts a structured JSON state), Strands Decider is optimized for plain-text input. The Lambda serializes the conversation into readable text:
+
+```
+User: How many PTO days does EMP-001 have left?
+[Tool: get_pto_balance({"employee_id": "EMP-001"})] → {"remaining": 10, "total": 15}
+Assistant: EMP-001 has 10 days of PTO remaining out of 15 total.
+
+User: Please book 2026-08-04 to 2026-08-06 off.
+[Tool: submit_pto_request({...})] → {"request_id": "PTO-2026-042"}
+Assistant: Done. PTO request PTO-2026-042 has been submitted.
+```
+
+For TRACE evaluation, only the current turn (plus a brief prior history) is sent; for SESSION evaluation, the full conversation is included.
+
+#### Evaluators
+
+| Evaluator | Level | Question type | What it checks |
+|---|---|---|---|
+| `DeciderGroundedness` | TRACE | `noul` | Every factual claim is supported by the tool results shown in the conversation |
+| `DeciderHelpfulness` | TRACE | `score` | How far the response moves the employee toward their goal (4-level rubric) |
+| `DeciderGoalCompletion` | SESSION | `choice` | Were all employee goals achieved by session end? |
+
+These are the same logical checks as the Jev evaluators, adapted to text-state instructions.
+
+#### Performance notes
+
+| Hardware | Median latency |
+|---|---|
+| NVIDIA RTX 3090 | ~115 ms per question |
+| Apple M3 MacBook | ~153 ms per question |
+| AWS g5.xlarge (A10G) | ~120 ms |
+| CPU only (c5.4xlarge) | ~1.5 s |
+
+Multiple questions can be batched in a single request; latency scales approximately linearly with the number of questions asked.
+
+#### AgentCore CLI
+
+```bash
+agentcore add evaluator \
+  --name DeciderGroundedness \
+  --level TRACE \
+  --type code-based \
+  --lambda-arn arn:aws:lambda:<region>:<account>:function:strands-decider-evaluator \
+  --timeout 90
+```
+
+---
+
+### Choosing between Jev, Strands Decider, and built-in evaluators
+
+| Criterion | Built-in (LLM) | Deterministic (Lambda) | Jev | Strands Decider |
+|---|---|---|---|---|
+| **Accuracy** | High | Exact | High, calibrated | High, calibrated |
+| **Cost** | LLM inference | Lambda only | API call fee | Self-hosted infra |
+| **Data privacy** | LLM provider | AWS | TypeSafe API | Your environment |
+| **Latency** | 2–10 s | < 1 ms | ~200 ms (network) | ~115 ms + network |
+| **Customizable** | Limited | Fully | Question definitions | Question definitions |
+| **Best for** | Qualitative nuance | Exact rules / facts | Calibrated judgment, no infra | Same + data-residency |

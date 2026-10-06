@@ -74,6 +74,28 @@ parser.add_argument(
     default=str(_DEFAULT_CONFIG),
     help="Path to agent_config.json (written by deploy.py)",
 )
+parser.add_argument(
+    "--with-jev",
+    action="store_true",
+    default=False,
+    help="Deploy JEV-based Lambda evaluators and run a demo session (requires --jev-secret-arn)",
+)
+parser.add_argument(
+    "--jev-secret-arn",
+    default="",
+    help="AWS Secrets Manager ARN containing the Jev API key (required when --with-jev is set)",
+)
+parser.add_argument(
+    "--with-decider",
+    action="store_true",
+    default=False,
+    help="Deploy Strands Decider Lambda evaluators and run a demo session (requires --decider-url)",
+)
+parser.add_argument(
+    "--decider-url",
+    default="http://localhost:8000",
+    help="URL of the running Strands Decider server, e.g. http://<host>:8000 (required when --with-decider is set)",
+)
 args = parser.parse_args()
 
 _config_path = Path(args.config)
@@ -775,6 +797,341 @@ print("  Evaluators HRResponseLength + HRFactChecker are now LOCKED to this conf
 print(f"  Config saved: {_RESULTS_DIR / 'online_eval_config.json'}")
 
 # ============================================================
+# 6. JEV Decision-Model Evaluators  (opt-in: --with-jev)
+# ============================================================
+#
+# Jev is a decision model hosted by TypeSafe that replaces LLM-as-a-judge
+# with a specialized, calibrated inference API. The Lambda below is a thin
+# wrapper that:
+#   1. Reconstructs conversation turns from the OTel spans
+#   2. Sends the structured state + question to the Jev API
+#   3. Converts the probability-weighted answer to an AgentCore score
+#
+# Three evaluators share one Lambda function. AgentCore passes the evaluator
+# name in each event so the Lambda can look up the right Jev question.
+#
+# Prerequisite: store your Jev API key in AWS Secrets Manager and pass the
+# secret ARN via --jev-secret-arn.
+
+if args.with_jev:
+    if not args.jev_secret_arn:
+        print("\n[6/7] SKIPPED JEV: --jev-secret-arn is required when using --with-jev")
+    else:
+        print("\n[6/7] Deploying and registering Jev decision-model evaluators ...")
+
+        JEV_LAMBDAS_DIR = LAMBDAS_DIR / "jev_evaluator"
+
+        def _make_zip_lightweight(source_dir: str) -> bytes:
+            """Bundle Lambda source files only (no extra pip packages).
+
+            The Jev and Strands Decider Lambda functions use only the Python
+            standard library plus boto3 (provided by the Lambda runtime), so
+            no additional packages need to be downloaded.
+            """
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for f in sorted(Path(source_dir).iterdir()):
+                    if f.is_file() and not f.name.endswith(".pyc"):
+                        zf.write(f, f.name)
+            buf.seek(0)
+            data = buf.read()
+            print(f"    Zip size: {len(data) // 1024} KB")
+            return data
+
+        def _deploy_lambda_lightweight(function_name: str, source_dir: str, env_vars: dict) -> str:
+            """Create or update a Lambda function with no extra pip dependencies."""
+            print(f"\n  Packaging {function_name} ...")
+            zip_bytes = _make_zip_lightweight(source_dir)
+            try:
+                resp = lambda_client.get_function(FunctionName=function_name)
+                print("  Updating existing function ...")
+                lambda_client.update_function_code(FunctionName=function_name, ZipFile=zip_bytes)
+                waiter = lambda_client.get_waiter("function_updated_v2")
+                waiter.wait(FunctionName=function_name)
+                lambda_client.update_function_configuration(
+                    FunctionName=function_name,
+                    Environment={"Variables": env_vars},
+                )
+                arn = resp["Configuration"]["FunctionArn"]
+            except lambda_client.exceptions.ResourceNotFoundException:
+                print("  Creating new function ...")
+                resp = lambda_client.create_function(
+                    FunctionName=function_name,
+                    Runtime="python3.12",
+                    Role=LAMBDA_ROLE_ARN,
+                    Handler="lambda_function.lambda_handler",
+                    Code={"ZipFile": zip_bytes},
+                    Timeout=120,
+                    MemorySize=128,
+                    Description=f"AgentCore decision-model evaluator: {function_name}",
+                    Environment={"Variables": env_vars},
+                )
+                waiter = lambda_client.get_waiter("function_active_v2")
+                waiter.wait(FunctionName=function_name)
+                arn = resp["FunctionArn"]
+            print(f"  ARN: {arn}")
+            return arn
+
+        # Grant Secrets Manager access to the Lambda execution role
+        _sm_policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Sid": "JevSecretRead",
+                "Effect": "Allow",
+                "Action": "secretsmanager:GetSecretValue",
+                "Resource": args.jev_secret_arn,
+            }],
+        })
+        iam_client.put_role_policy(
+            RoleName=LAMBDA_ROLE_NAME,
+            PolicyName="JevSecretReadPolicy",
+            PolicyDocument=_sm_policy,
+        )
+        print("  Added secretsmanager:GetSecretValue to Lambda role")
+        time.sleep(5)
+
+        ARN_JEV = _deploy_lambda_lightweight(
+            "jev-evaluator",
+            str(JEV_LAMBDAS_DIR),
+            env_vars={
+                "JEV_API_KEY_SECRET_ARN": args.jev_secret_arn,
+                "JEV_MODEL": "jev-latest",
+            },
+        )
+        _add_invoke_permission("jev-evaluator")
+
+        # Register three evaluators, each pointing to the same Lambda ARN.
+        # AgentCore passes evaluatorName in each invocation event so the Lambda
+        # can route to the correct Jev question definition.
+        JEV_EVALUATOR_DEFS = [
+            ("JevGroundedness", "TRACE", 90),
+            ("JevHelpfulness", "TRACE", 90),
+            ("JevGoalCompletion", "SESSION", 90),
+        ]
+
+        jev_ids: dict[str, str] = {}
+        for eval_name, eval_level, timeout_s in JEV_EVALUATOR_DEFS:
+            unique_name = f"{eval_name}_{RUN_SUFFIX}"
+            print(f"  Creating '{unique_name}' (level={eval_level}) ...")
+            resp = _cp.create_evaluator(
+                evaluatorName=unique_name,
+                level=eval_level,
+                evaluatorConfig={
+                    "codeBased": {
+                        "lambdaConfig": {
+                            "lambdaArn": ARN_JEV,
+                            "lambdaTimeoutInSeconds": timeout_s,
+                        }
+                    }
+                },
+            )
+            jev_ids[eval_name] = resp["evaluatorId"]
+            print(f"    evaluatorId: {resp['evaluatorId']}")
+
+        (_RESULTS_DIR / "jev_evaluator_ids.json").write_text(
+            json.dumps({"lambda_arn": ARN_JEV, "evaluator_ids": jev_ids}, indent=2)
+        )
+
+        # Invoke agent and evaluate with Jev evaluators
+        JEV_SESSION_ID = f"jev-eval-{uuid.uuid4()}"
+        print(f"\n  Invoking agent for Jev evaluation (session: {JEV_SESSION_ID[:30]}...) ...")
+        for prompt in ON_DEMAND_TURNS:
+            print(f"    > {prompt[:70]}")
+            _invoke_agent(prompt, JEV_SESSION_ID)
+
+        print("\n  Waiting 90s for CloudWatch log ingestion ...")
+        time.sleep(90)
+
+        jev_ec = EvaluationClient(region_name=REGION)
+        jev_ec._evaluator_level_cache.update(
+            {jev_ids["JevGroundedness"]: "TRACE",
+             jev_ids["JevHelpfulness"]: "TRACE",
+             jev_ids["JevGoalCompletion"]: "SESSION"}
+        )
+
+        jev_results = jev_ec.run(
+            evaluator_ids=list(jev_ids.values()),
+            agent_id=AGENT_ID,
+            session_id=JEV_SESSION_ID,
+            look_back_time=timedelta(hours=1),
+        )
+
+        _jev_name_map = {v: k for k, v in jev_ids.items()}
+        print(f"\n  Jev results ({len(jev_results)} result(s)):\n")
+        print(f"  {'Evaluator':<30} {'Value':<8} {'Label'}")
+        print("  " + "-" * 60)
+        for r in jev_results:
+            eid = r.get("evaluatorId", "")
+            name = _jev_name_map.get(eid, eid[:20])
+            value = r.get("value", "N/A")
+            label = r.get("label", "N/A")
+            if r.get("errorCode"):
+                label = f"ERR:{r['errorCode']}"
+            print(f"  {name:<30} {str(value):<8} {str(label)}")
+
+        (_RESULTS_DIR / "jev_results.json").write_text(
+            json.dumps({"session_id": JEV_SESSION_ID, "results": jev_results,
+                        "evaluator_ids": jev_ids}, indent=2, default=str)
+        )
+        print(f"\n  Jev results saved: {_RESULTS_DIR / 'jev_results.json'}")
+
+
+# ============================================================
+# 7. Strands Decider Evaluators  (opt-in: --with-decider)
+# ============================================================
+#
+# Strands Decider 2B is an open-source, self-hostable decision model that
+# exposes the same /v1/systemone HTTP API as Jev. Because it runs on your
+# own hardware, there is no external API key and no data egress.
+#
+# The Lambda connects to a running Strands Decider server via DECIDER_SERVER_URL.
+# Conversation turns are serialized to plain text before sending to the server,
+# since Strands Decider operates on text state rather than structured JSON.
+#
+# Start the server before running this script:
+#   pip install strands-decider
+#   strands-decider serve StrandsAgents/strands-decider-2B-hobson-v21 --port 8000
+#
+# Or via Docker:
+#   docker run --rm -p 8000:8000 \
+#       -e MODEL=StrandsAgents/strands-decider-2B-hobson-v21 \
+#       public.ecr.aws/strands/decider:latest
+#
+# Then pass the URL: python evaluate.py --with-decider --decider-url http://<host>:8000
+
+if args.with_decider:
+    print("\n[7/7] Deploying and registering Strands Decider evaluators ...")
+    print(f"  Decider server : {args.decider_url}")
+
+    DECIDER_LAMBDAS_DIR = LAMBDAS_DIR / "strands_decider_evaluator"
+
+    if "_make_zip_lightweight" not in dir():
+        def _make_zip_lightweight(source_dir: str) -> bytes:  # type: ignore[no-redef]
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for f in sorted(Path(source_dir).iterdir()):
+                    if f.is_file() and not f.name.endswith(".pyc"):
+                        zf.write(f, f.name)
+            buf.seek(0)
+            data = buf.read()
+            print(f"    Zip size: {len(data) // 1024} KB")
+            return data
+
+        def _deploy_lambda_lightweight(function_name: str, source_dir: str, env_vars: dict) -> str:  # type: ignore[no-redef]
+            print(f"\n  Packaging {function_name} ...")
+            zip_bytes = _make_zip_lightweight(source_dir)
+            try:
+                resp = lambda_client.get_function(FunctionName=function_name)
+                print("  Updating existing function ...")
+                lambda_client.update_function_code(FunctionName=function_name, ZipFile=zip_bytes)
+                waiter = lambda_client.get_waiter("function_updated_v2")
+                waiter.wait(FunctionName=function_name)
+                lambda_client.update_function_configuration(
+                    FunctionName=function_name,
+                    Environment={"Variables": env_vars},
+                )
+                arn = resp["Configuration"]["FunctionArn"]
+            except lambda_client.exceptions.ResourceNotFoundException:
+                print("  Creating new function ...")
+                resp = lambda_client.create_function(
+                    FunctionName=function_name,
+                    Runtime="python3.12",
+                    Role=LAMBDA_ROLE_ARN,
+                    Handler="lambda_function.lambda_handler",
+                    Code={"ZipFile": zip_bytes},
+                    Timeout=120,
+                    MemorySize=128,
+                    Description=f"AgentCore decision-model evaluator: {function_name}",
+                    Environment={"Variables": env_vars},
+                )
+                waiter = lambda_client.get_waiter("function_active_v2")
+                waiter.wait(FunctionName=function_name)
+                arn = resp["FunctionArn"]
+            print(f"  ARN: {arn}")
+            return arn
+
+    ARN_DECIDER = _deploy_lambda_lightweight(
+        "strands-decider-evaluator",
+        str(DECIDER_LAMBDAS_DIR),
+        env_vars={"DECIDER_SERVER_URL": args.decider_url},
+    )
+    _add_invoke_permission("strands-decider-evaluator")
+
+    DECIDER_EVALUATOR_DEFS = [
+        ("DeciderGroundedness", "TRACE", 90),
+        ("DeciderHelpfulness", "TRACE", 90),
+        ("DeciderGoalCompletion", "SESSION", 90),
+    ]
+
+    decider_ids: dict[str, str] = {}
+    for eval_name, eval_level, timeout_s in DECIDER_EVALUATOR_DEFS:
+        unique_name = f"{eval_name}_{RUN_SUFFIX}"
+        print(f"  Creating '{unique_name}' (level={eval_level}) ...")
+        resp = _cp.create_evaluator(
+            evaluatorName=unique_name,
+            level=eval_level,
+            evaluatorConfig={
+                "codeBased": {
+                    "lambdaConfig": {
+                        "lambdaArn": ARN_DECIDER,
+                        "lambdaTimeoutInSeconds": timeout_s,
+                    }
+                }
+            },
+        )
+        decider_ids[eval_name] = resp["evaluatorId"]
+        print(f"    evaluatorId: {resp['evaluatorId']}")
+
+    (_RESULTS_DIR / "decider_evaluator_ids.json").write_text(
+        json.dumps({"lambda_arn": ARN_DECIDER, "server_url": args.decider_url,
+                    "evaluator_ids": decider_ids}, indent=2)
+    )
+
+    # Invoke agent and evaluate with Strands Decider evaluators
+    DECIDER_SESSION_ID = f"decider-eval-{uuid.uuid4()}"
+    print(f"\n  Invoking agent for Decider evaluation (session: {DECIDER_SESSION_ID[:30]}...) ...")
+    for prompt in ON_DEMAND_TURNS:
+        print(f"    > {prompt[:70]}")
+        _invoke_agent(prompt, DECIDER_SESSION_ID)
+
+    print("\n  Waiting 90s for CloudWatch log ingestion ...")
+    time.sleep(90)
+
+    decider_ec = EvaluationClient(region_name=REGION)
+    decider_ec._evaluator_level_cache.update(
+        {decider_ids["DeciderGroundedness"]: "TRACE",
+         decider_ids["DeciderHelpfulness"]: "TRACE",
+         decider_ids["DeciderGoalCompletion"]: "SESSION"}
+    )
+
+    decider_results = decider_ec.run(
+        evaluator_ids=list(decider_ids.values()),
+        agent_id=AGENT_ID,
+        session_id=DECIDER_SESSION_ID,
+        look_back_time=timedelta(hours=1),
+    )
+
+    _dec_name_map = {v: k for k, v in decider_ids.items()}
+    print(f"\n  Strands Decider results ({len(decider_results)} result(s)):\n")
+    print(f"  {'Evaluator':<30} {'Value':<8} {'Label'}")
+    print("  " + "-" * 60)
+    for r in decider_results:
+        eid = r.get("evaluatorId", "")
+        name = _dec_name_map.get(eid, eid[:20])
+        value = r.get("value", "N/A")
+        label = r.get("label", "N/A")
+        if r.get("errorCode"):
+            label = f"ERR:{r['errorCode']}"
+        print(f"  {name:<30} {str(value):<8} {str(label)}")
+
+    (_RESULTS_DIR / "decider_results.json").write_text(
+        json.dumps({"session_id": DECIDER_SESSION_ID, "results": decider_results,
+                    "evaluator_ids": decider_ids}, indent=2, default=str)
+    )
+    print(f"\n  Strands Decider results saved: {_RESULTS_DIR / 'decider_results.json'}")
+
+
+# ============================================================
 # Summary
 # ============================================================
 
@@ -786,6 +1143,12 @@ print("  Evaluators registered      : HRResponseLength (TRACE), HRFactChecker (S
 print("  On-demand results          : results/on_demand_results.json")
 print("  Dataset runner results     : results/dataset_runner_results.json")
 print(f"  Online eval config active  : {ONLINE_CONFIG_NAME}")
+if args.with_jev and args.jev_secret_arn:
+    print("  Jev evaluators             : JevGroundedness, JevHelpfulness, JevGoalCompletion")
+    print("  Jev results                : results/jev_results.json")
+if args.with_decider:
+    print("  Decider evaluators         : DeciderGroundedness, DeciderHelpfulness, DeciderGoalCompletion")
+    print("  Decider results            : results/decider_results.json")
 print()
 print("  Disable online config when done:")
 print("    aws bedrock-agentcore-control update-online-evaluation-config \\")
