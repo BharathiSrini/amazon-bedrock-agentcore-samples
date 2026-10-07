@@ -745,16 +745,6 @@ For TRACE evaluation, only the current turn (plus a brief prior history) is sent
 
 These are the same logical checks as the Jev evaluators, adapted to text-state instructions.
 
-#### Performance notes
-
-| Hardware | Median latency |
-|---|---|
-| NVIDIA RTX 3090 | ~115 ms per question |
-| Apple M3 MacBook | ~153 ms per question |
-| AWS g5.xlarge (A10G) | ~120 ms |
-| CPU only (c5.4xlarge) | ~1.5 s |
-
-Multiple questions can be batched in a single request; latency scales approximately linearly with the number of questions asked.
 
 #### AgentCore CLI
 
@@ -775,7 +765,6 @@ agentcore add evaluator \
 |---|---|---|---|---|
 | **Accuracy** | High | Exact | High, calibrated | High, calibrated |
 | **Cost** | LLM inference | Lambda only | API call fee | Self-hosted infra |
-| **Data privacy** | LLM provider | AWS | TypeSafe API | Your environment |
 | **Latency** | 2–10 s | < 1 ms | ~200 ms (network) | ~115 ms + network |
-| **Customizable** | Limited | Fully | Question definitions | Question definitions |
+| **Customizable** | Prompt based | Fully | Question definitions | Question definitions |
 | **Best for** | Qualitative nuance | Exact rules / facts | Calibrated judgment, no infra | Same + data-residency |
