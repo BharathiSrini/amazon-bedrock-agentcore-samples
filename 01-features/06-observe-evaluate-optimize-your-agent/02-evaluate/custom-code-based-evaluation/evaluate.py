@@ -443,7 +443,7 @@ def _invoke_agent(prompt: str, session_id: str) -> str:
             chunk = line[len("data: ") :]
             try:
                 chunk = json.loads(chunk)
-            except Exception:
+            except json.JSONDecodeError:  # noqa: S110
                 pass
             parts.append(str(chunk))
     return "".join(parts) if parts else raw
@@ -466,8 +466,8 @@ for prompt in ON_DEMAND_TURNS:
 print("\n  Waiting 150s for CloudWatch log ingestion ...")
 time.sleep(150)
 
-from bedrock_agentcore.evaluation import EvaluationClient  # noqa: E402
-from datetime import timedelta  # noqa: E402
+from datetime import timedelta
+from bedrock_agentcore.evaluation import EvaluationClient
 
 ec = EvaluationClient(region_name=REGION)
 ec._evaluator_level_cache.update(
@@ -503,7 +503,7 @@ for r in od_results:
     error = r.get("errorCode")
     if error:
         label = f"ERR:{error}"
-    print(f"  {name:<45} {str(value):<8} {str(label)}")
+    print(f"  {name:<45} {value!s:<8} {label!s}")
 
 (_RESULTS_DIR / "on_demand_results.json").write_text(
     json.dumps(
@@ -527,7 +527,7 @@ for r in od_results:
 
 print("\n  Running OnDemandEvaluationDatasetRunner (mixed evaluators) ...")
 
-from bedrock_agentcore.evaluation import (  # noqa: E402
+from bedrock_agentcore.evaluation import (
     AgentInvokerInput,
     AgentInvokerOutput,
     CloudWatchAgentSpanCollector,
@@ -556,7 +556,7 @@ def _agent_invoker(invoker_input: AgentInvokerInput) -> AgentInvokerOutput:
             chunk = line[len("data: ") :]
             try:
                 chunk = json.loads(chunk)
-            except Exception:
+            except json.JSONDecodeError:  # noqa: S110
                 pass
             parts.append(str(chunk))
     return AgentInvokerOutput(agent_output="".join(parts) if parts else raw)
@@ -692,7 +692,7 @@ for sr in _dataset_result.scenario_results:
             error = res.get("errorCode")
             if error:
                 label = f"ERR:{error}"
-            print(f"    {name:<40} {str(value):<8} {str(label)}")
+            print(f"    {name:<40} {value!s:<8} {label!s}")
 
 (_RESULTS_DIR / "dataset_runner_results.json").write_text(
     json.dumps(_dataset_result.model_dump(), indent=2, default=str)
@@ -1017,7 +1017,7 @@ if args.with_jev:
             label = r.get("label", "N/A")
             if r.get("errorCode"):
                 label = f"ERR:{r['errorCode']}"
-            print(f"  {name:<30} {str(value):<8} {str(label)}")
+            print(f"  {name:<30} {value!s:<8} {label!s}")
 
         (_RESULTS_DIR / "jev_results.json").write_text(
             json.dumps({"session_id": JEV_SESSION_ID, "results": jev_results,
@@ -1109,7 +1109,7 @@ if args.with_decider:
     _decider_instance_id = None
 
     if args.decider_ec2:
-        import base64  # noqa: PLC0415
+        import base64
 
         ec2_client = boto3.client("ec2", region_name=REGION)
         ssm_client = boto3.client("ssm", region_name=REGION)
@@ -1346,7 +1346,7 @@ disown
                     print("  SSM agent online.")
                     _ssm_agent_ready = True
                     break
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
             print(f"  Waiting for SSM agent ({_i + 1}/36) ...")
             time.sleep(10)
@@ -1367,12 +1367,14 @@ disown
                         InstanceIds=[_decider_instance_id],
                         DocumentName="AWS-RunShellScript",
                         Parameters={"commands": [
-                            "printf '%s' "
-                            '\'{"state":"ping","questions":{"ping":{"type":"noul","definition":"test"}}}\''
-                            " > /tmp/decider_ping.json && "
-                            "curl -sf -m 15 -X POST http://localhost:8000/v1/systemone "
-                            "-H 'Content-Type: application/json' "
-                            "-d @/tmp/decider_ping.json > /dev/null && echo READY"
+                            (
+                                "printf '%s' "
+                                '\'{"state":"ping","questions":{"ping":{"type":"noul","definition":"test"}}}\''
+                                " > /tmp/decider_ping.json && "
+                                "curl -sf -m 15 -X POST http://localhost:8000/v1/systemone "
+                                "-H 'Content-Type: application/json' "
+                                "-d @/tmp/decider_ping.json > /dev/null && echo READY"
+                            )
                         ]},
                     )
                     _cmd_id = _cmd["Command"]["CommandId"]
@@ -1388,7 +1390,7 @@ disown
                         break
                     _status = _inv.get("Status", "unknown")
                     print(f"  Server not ready (attempt {_poll_attempt}, status={_status}) ...")
-                except Exception as _poll_err:
+                except Exception as _poll_err:  # noqa: BLE001
                     print(f"  Poll attempt {_poll_attempt} error: {_poll_err}")
                 time.sleep(15)
 
@@ -1494,7 +1496,7 @@ disown
         label = r.get("label", "N/A")
         if r.get("errorCode"):
             label = f"ERR:{r['errorCode']}"
-        print(f"  {name:<30} {str(value):<8} {str(label)}")
+        print(f"  {name:<30} {value!s:<8} {label!s}")
 
     (_RESULTS_DIR / "decider_results.json").write_text(
         json.dumps({"session_id": DECIDER_SESSION_ID, "results": decider_results,

@@ -158,7 +158,7 @@ def _build_state_text(level: str, turns: list[Turn], target_trace_ids: list[str]
 # ---------------------------------------------------------------------------
 
 def _dist(labels: list[str], probs: list[float]) -> str:
-    return ", ".join(f"{l} {p:.2f}" for l, p in zip(labels, probs))
+    return ", ".join(f"{lbl} {p:.2f}" for lbl, p in zip(labels, probs))
 
 
 def _interpret(definition: dict[str, Any], answer: dict[str, Any], model: str) -> dict[str, Any]:
@@ -248,9 +248,8 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             "emit GenAI OpenTelemetry spans and message events.",
         )
 
-    if level == "TRACE" and target_traces:
-        if not any(t.trace_id in target_traces for t in turns):
-            return _error("TARGET_NOT_FOUND", f"No agent turn matches target traces {target_traces}")
+    if level == "TRACE" and target_traces and not any(t.trace_id in target_traces for t in turns):
+        return _error("TARGET_NOT_FOUND", f"No agent turn matches target traces {target_traces}")
 
     state_text = _build_state_text(level, turns, target_traces)
 

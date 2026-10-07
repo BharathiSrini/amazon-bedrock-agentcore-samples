@@ -14,6 +14,29 @@ Evaluate your Amazon Bedrock AgentCore agent using **deterministic Lambda-backed
 | **Dataset runner** | Automate agent invocation + evaluation across multiple scenarios |
 | **Online evaluation** | Create a config that continuously scores live traffic with code-based evaluators |
 
+## Solution Overview
+
+The sample evaluates an HR Assistant agent built with Strands Agents using three evaluator types side by side: deterministic code-based Lambda evaluators, built-in LLM-as-a-judge evaluators, and (optionally) decision-model evaluators backed by Jev or Strands Decider 2B.
+
+Two Python scripts handle everything — no CDK, no additional tooling:
+
+- **`../utils/deploy.py`** — deploys the HR Assistant to AgentCore Runtime. The agent answers employee questions with five tools returning fixed mock data (PTO balances, PTO requests, HR policies, benefits, pay stubs).
+- **`evaluate.py`** — deploys and registers evaluators, invokes the agent, and runs all evaluation modes. Running it without flags executes five steps:
+  1. Creates the Lambda execution role (`AgentCoreLambdaEvaluatorRole`)
+  2. Packages and deploys two Lambda evaluators: `hr-response-length` (TRACE — checks response length) and `hr-fact-checker` (SESSION — regex-validates HR facts against known mock data)
+  3. Registers both as AgentCore code-based evaluators via the control plane
+  4. Runs on-demand evaluation with `EvaluationClient` and `OnDemandEvaluationDatasetRunner` across five labeled scenarios, mixing the code-based evaluators with `Builtin.Correctness`, `Builtin.Helpfulness`, and `Builtin.ResponseRelevance`
+  5. Creates an online evaluation config that continuously scores live sessions at 100% sampling
+
+**Decision-model add-ons** are opt-in via flags and add no overhead to the base flow:
+
+- `--with-jev --jev-secret-arn <ARN>` — deploys `jev-evaluator` and registers `JevGroundedness`, `JevHelpfulness`, and `JevGoalCompletion`. Jev is a hosted decision model from TypeSafe; conversation data is sent to TypeSafe's API.
+- `--with-decider` — deploys `strands-decider-evaluator` and registers the same three evaluators backed by [Strands Decider 2B](https://strandsagents.com/blog/introducing-strands-decider/), an open-source model you self-host. Add `--decider-ec2` to auto-provision the EC2 instance, security groups, IAM role, and Lambda VPC configuration with no manual AWS console steps.
+
+Both decision-model backends share the same Lambda architecture: a single function handles all three evaluators by reading its invoked Lambda alias name from `context.invoked_function_arn` and looking up the matching question definition in `evaluators.json`. One alias per evaluator is created at deploy time, so each evaluator invokes only its own alias and the function has a single code path and log group.
+
+---
+
 ## Setup with AgentCore CLI
 
 The fastest way to bootstrap and deploy the agent is with the [AgentCore CLI](https://github.com/aws/agentcore-cli) (`0.30.0`).

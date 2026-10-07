@@ -7,4 +7,4 @@ All evaluation logic lives in handler.py. See that file and evaluators.json
 for the full evaluator definitions and Jev question format.
 """
 
-from handler import handler as lambda_handler  # noqa: F401
+from handler import handler as lambda_handler
