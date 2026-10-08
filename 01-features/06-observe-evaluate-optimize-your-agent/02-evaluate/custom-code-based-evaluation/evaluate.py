@@ -443,7 +443,7 @@ def _invoke_agent(prompt: str, session_id: str) -> str:
             chunk = line[len("data: ") :]
             try:
                 chunk = json.loads(chunk)
-            except json.JSONDecodeError:  # noqa: S110
+            except json.JSONDecodeError:
                 pass
             parts.append(str(chunk))
     return "".join(parts) if parts else raw
@@ -467,6 +467,7 @@ print("\n  Waiting 150s for CloudWatch log ingestion ...")
 time.sleep(150)
 
 from datetime import timedelta
+
 from bedrock_agentcore.evaluation import EvaluationClient
 
 ec = EvaluationClient(region_name=REGION)
@@ -556,7 +557,7 @@ def _agent_invoker(invoker_input: AgentInvokerInput) -> AgentInvokerOutput:
             chunk = line[len("data: ") :]
             try:
                 chunk = json.loads(chunk)
-            except json.JSONDecodeError:  # noqa: S110
+            except json.JSONDecodeError:
                 pass
             parts.append(str(chunk))
     return AgentInvokerOutput(agent_output="".join(parts) if parts else raw)
