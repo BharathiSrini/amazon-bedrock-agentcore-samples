@@ -61,10 +61,7 @@ _API_ENDPOINT = f"{_SERVER_URL}/v1/systemone"
 _MAX_ATTEMPTS = 4
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
-DEFINITIONS = {
-    d["name"]: d
-    for d in json.loads((Path(__file__).parent / "evaluators.json").read_text())["evaluators"]
-}
+DEFINITIONS = {d["name"]: d for d in json.loads((Path(__file__).parent / "evaluators.json").read_text())["evaluators"]}
 
 
 class _DeciderError(Exception):
@@ -82,6 +79,7 @@ def _error(code: str, message: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 # HTTP call to Strands Decider server
 # ---------------------------------------------------------------------------
+
 
 def _post(body: bytes, timeout: float) -> dict[str, Any]:
     req = urllib.request.Request(
@@ -109,9 +107,7 @@ def _ask(state_text: str, questions: dict[str, Any], remaining_ms) -> dict[str, 
         except urllib.error.HTTPError as err:
             detail = err.read().decode(errors="replace")[:500]
             if err.code not in _RETRYABLE_STATUS or attempt == _MAX_ATTEMPTS:
-                raise _DeciderError(
-                    "DECIDER_API_ERROR", f"Decider returned HTTP {err.code}: {detail}"
-                ) from err
+                raise _DeciderError("DECIDER_API_ERROR", f"Decider returned HTTP {err.code}: {detail}") from err
         except (urllib.error.URLError, TimeoutError) as err:
             if attempt == _MAX_ATTEMPTS:
                 raise _DeciderError(
@@ -126,6 +122,7 @@ def _ask(state_text: str, questions: dict[str, Any], remaining_ms) -> dict[str, 
 # ---------------------------------------------------------------------------
 # State serialization — structured turns → plain text for Strands Decider
 # ---------------------------------------------------------------------------
+
 
 def _turn_to_text(turn: Turn) -> str:
     parts = [f"User: {turn.user}"]
@@ -156,6 +153,7 @@ def _build_state_text(level: str, turns: list[Turn], target_trace_ids: list[str]
 # ---------------------------------------------------------------------------
 # Response interpretation — identical schema to Jev
 # ---------------------------------------------------------------------------
+
 
 def _dist(labels: list[str], probs: list[float]) -> str:
     return ", ".join(f"{lbl} {p:.2f}" for lbl, p in zip(labels, probs))
@@ -208,6 +206,7 @@ def _interpret(definition: dict[str, Any], answer: dict[str, Any], model: str) -
 # Evaluator name resolution — same fallback chain as Jev handler
 # ---------------------------------------------------------------------------
 
+
 def _evaluator_name(event: dict[str, Any], context: Any) -> str:
     if event.get("evaluatorName"):
         return _SUFFIX_RE.sub("", event["evaluatorName"])
@@ -223,14 +222,14 @@ def _evaluator_name(event: dict[str, Any], context: Any) -> str:
 # Lambda entry point
 # ---------------------------------------------------------------------------
 
+
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     name = _evaluator_name(event, context)
     definition = DEFINITIONS.get(name)
     if definition is None:
         return _error(
             "UNKNOWN_EVALUATOR",
-            f"No Decider definition for evaluator {name!r}. "
-            "Valid names: " + ", ".join(DEFINITIONS),
+            f"No Decider definition for evaluator {name!r}. Valid names: " + ", ".join(DEFINITIONS),
         )
 
     level = event.get("evaluationLevel", "")
@@ -266,13 +265,17 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     except (KeyError, TypeError, ValueError) as err:
         return _error("DECIDER_BAD_RESPONSE", f"Unexpected Decider response: {err!r}")
 
-    logger.info(json.dumps({
-        "evaluator": name,
-        "level": level,
-        "server": _SERVER_URL,
-        "model": result.get("model"),
-        "latency_ms": result.get("latency_ms"),
-        "label": output["label"],
-        "value": output["value"],
-    }))
+    logger.info(
+        json.dumps(
+            {
+                "evaluator": name,
+                "level": level,
+                "server": _SERVER_URL,
+                "model": result.get("model"),
+                "latency_ms": result.get("latency_ms"),
+                "label": output["label"],
+                "value": output["value"],
+            }
+        )
+    )
     return output

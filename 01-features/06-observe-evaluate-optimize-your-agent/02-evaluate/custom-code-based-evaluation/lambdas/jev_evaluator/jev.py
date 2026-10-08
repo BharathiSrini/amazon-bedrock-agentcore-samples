@@ -77,8 +77,7 @@ def ask(
             if error.code == 401:
                 raise JevError(
                     "JEV_AUTH_FAILED",
-                    "Jev rejected the API key. Store a valid key in the "
-                    f"{SECRET_ARN} secret.",
+                    f"Jev rejected the API key. Store a valid key in the {SECRET_ARN} secret.",
                 ) from error
             if error.code not in RETRYABLE_STATUS or attempt == MAX_ATTEMPTS:
                 code = "JEV_VALIDATION_FAILED" if error.code == 422 else "JEV_API_ERROR"

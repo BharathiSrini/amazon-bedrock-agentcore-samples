@@ -27,9 +27,7 @@ logger.setLevel(logging.INFO)
 
 DEFINITIONS = {
     definition["name"]: definition
-    for definition in json.loads(
-        (Path(__file__).parent / "evaluators.json").read_text()
-    )["evaluators"]
+    for definition in json.loads((Path(__file__).parent / "evaluators.json").read_text())["evaluators"]
 }
 
 
@@ -64,10 +62,7 @@ def build_state(
             raise LookupError(f"No agent turn matches target traces {target_trace_ids}")
         position = matches[0] if matches else len(turns) - 1
         state = {
-            "previous_turns": [
-                {"user": t.user, "assistant_response": t.assistant_response}
-                for t in turns[:position]
-            ],
+            "previous_turns": [{"user": t.user, "assistant_response": t.assistant_response} for t in turns[:position]],
             "current_turn": turns[position].as_state(),
         }
     if reference:

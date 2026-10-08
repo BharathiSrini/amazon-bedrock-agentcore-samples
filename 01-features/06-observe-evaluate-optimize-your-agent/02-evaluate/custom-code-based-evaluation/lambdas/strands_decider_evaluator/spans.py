@@ -186,9 +186,7 @@ def _first_assistant_text(messages: _Messages) -> str:
 
 def _tool_call(document: dict[str, Any], messages: _Messages) -> ToolCall:
     attributes = document.get("attributes") or {}
-    name = attributes.get("gen_ai.tool.name") or (document.get("name") or "").removeprefix(
-        "execute_tool "
-    )
+    name = attributes.get("gen_ai.tool.name") or (document.get("name") or "").removeprefix("execute_tool ")
     tool_input = messages.inputs[0].get("content") if messages.inputs else None
     tool_output = messages.outputs[0].get("content") if messages.outputs else None
     return ToolCall(name=name, input=_payload(tool_input), output=_payload(tool_output))
@@ -214,9 +212,7 @@ def build_turns(spans: list[dict[str, Any]]) -> list[Turn]:
                 messages[document.get("spanId", "")]
             )
         turn.tool_calls = [
-            _tool_call(d, messages[d.get("spanId", "")])
-            for d in documents
-            if _operation(d) == "execute_tool"
+            _tool_call(d, messages[d.get("spanId", "")]) for d in documents if _operation(d) == "execute_tool"
         ]
         if turn.user or turn.assistant_response:
             turns.append(turn)

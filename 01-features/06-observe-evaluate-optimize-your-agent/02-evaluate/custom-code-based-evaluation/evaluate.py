@@ -898,15 +898,19 @@ if args.with_jev:
             return arn
 
         # Grant Secrets Manager access to the Lambda execution role
-        _sm_policy = json.dumps({
-            "Version": "2012-10-17",
-            "Statement": [{
-                "Sid": "JevSecretRead",
-                "Effect": "Allow",
-                "Action": "secretsmanager:GetSecretValue",
-                "Resource": args.jev_secret_arn,
-            }],
-        })
+        _sm_policy = json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Sid": "JevSecretRead",
+                        "Effect": "Allow",
+                        "Action": "secretsmanager:GetSecretValue",
+                        "Resource": args.jev_secret_arn,
+                    }
+                ],
+            }
+        )
         iam_client.put_role_policy(
             RoleName=LAMBDA_ROLE_NAME,
             PolicyName="JevSecretReadPolicy",
@@ -995,9 +999,11 @@ if args.with_jev:
 
         jev_ec = EvaluationClient(region_name=REGION)
         jev_ec._evaluator_level_cache.update(
-            {jev_ids["JevGroundedness"]: "TRACE",
-             jev_ids["JevHelpfulness"]: "TRACE",
-             jev_ids["JevGoalCompletion"]: "SESSION"}
+            {
+                jev_ids["JevGroundedness"]: "TRACE",
+                jev_ids["JevHelpfulness"]: "TRACE",
+                jev_ids["JevGoalCompletion"]: "SESSION",
+            }
         )
 
         jev_results = jev_ec.run(
@@ -1021,8 +1027,9 @@ if args.with_jev:
             print(f"  {name:<30} {value!s:<8} {label!s}")
 
         (_RESULTS_DIR / "jev_results.json").write_text(
-            json.dumps({"session_id": JEV_SESSION_ID, "results": jev_results,
-                        "evaluator_ids": jev_ids}, indent=2, default=str)
+            json.dumps(
+                {"session_id": JEV_SESSION_ID, "results": jev_results, "evaluator_ids": jev_ids}, indent=2, default=str
+            )
         )
         print(f"\n  Jev results saved: {_RESULTS_DIR / 'jev_results.json'}")
 
@@ -1057,6 +1064,7 @@ if args.with_decider:
     DECIDER_LAMBDAS_DIR = LAMBDAS_DIR / "strands_decider_evaluator"
 
     if "_make_zip_lightweight" not in dir():
+
         def _make_zip_lightweight(source_dir: str) -> bytes:  # type: ignore[no-redef]
             buf = io.BytesIO()
             with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -1118,9 +1126,7 @@ if args.with_decider:
         print("\n  Provisioning EC2 Decider server (--decider-ec2) ...")
 
         # --- 1. Default VPC and subnets ---
-        _vpcs = ec2_client.describe_vpcs(
-            Filters=[{"Name": "isDefault", "Values": ["true"]}]
-        )["Vpcs"]
+        _vpcs = ec2_client.describe_vpcs(Filters=[{"Name": "isDefault", "Values": ["true"]}])["Vpcs"]
         if not _vpcs:
             print("  ERROR: No default VPC found. Create one or pass --decider-url manually.")
             sys.exit(1)
@@ -1148,31 +1154,27 @@ if args.with_decider:
                 _id = existing[0]["GroupId"]
                 print(f"  Reusing SG {sg_name}: {_id}")
                 return _id
-            _resp = ec2_client.create_security_group(
-                GroupName=sg_name, Description=description, VpcId=_ec2_vpc_id
-            )
+            _resp = ec2_client.create_security_group(GroupName=sg_name, Description=description, VpcId=_ec2_vpc_id)
             _id = _resp["GroupId"]
             ec2_client.create_tags(Resources=[_id], Tags=[{"Key": "Name", "Value": sg_name}])
             print(f"  Created SG {sg_name}: {_id}")
             return _id
 
-        _lambda_sg_id = _get_or_create_sg(
-            "DeciderLambdaSG", "Outbound SG for Lambda calling Strands Decider"
-        )
-        _server_sg_id = _get_or_create_sg(
-            "DeciderServerSG", "Inbound SG for Strands Decider EC2 server"
-        )
+        _lambda_sg_id = _get_or_create_sg("DeciderLambdaSG", "Outbound SG for Lambda calling Strands Decider")
+        _server_sg_id = _get_or_create_sg("DeciderServerSG", "Inbound SG for Strands Decider EC2 server")
 
         # Allow TCP 8000 from Lambda SG into Server SG (idempotent)
         try:
             ec2_client.authorize_security_group_ingress(
                 GroupId=_server_sg_id,
-                IpPermissions=[{
-                    "IpProtocol": "tcp",
-                    "FromPort": 8000,
-                    "ToPort": 8000,
-                    "UserIdGroupPairs": [{"GroupId": _lambda_sg_id}],
-                }],
+                IpPermissions=[
+                    {
+                        "IpProtocol": "tcp",
+                        "FromPort": 8000,
+                        "ToPort": 8000,
+                        "UserIdGroupPairs": [{"GroupId": _lambda_sg_id}],
+                    }
+                ],
             )
             print(f"  Allowed TCP 8000 from {_lambda_sg_id} → {_server_sg_id}")
         except Exception as _sg_err:
@@ -1182,14 +1184,18 @@ if args.with_decider:
         # --- 3. IAM instance profile for EC2 (SSM access) ---
         _ec2_role_name = "DeciderServerRole"
         _ec2_profile_name = "DeciderServerInstanceProfile"
-        _ec2_trust = json.dumps({
-            "Version": "2012-10-17",
-            "Statement": [{
-                "Effect": "Allow",
-                "Principal": {"Service": "ec2.amazonaws.com"},
-                "Action": "sts:AssumeRole",
-            }],
-        })
+        _ec2_trust = json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": {"Service": "ec2.amazonaws.com"},
+                        "Action": "sts:AssumeRole",
+                    }
+                ],
+            }
+        )
         try:
             iam_client.get_role(RoleName=_ec2_role_name)
             print(f"  Reusing IAM role: {_ec2_role_name}")
@@ -1212,9 +1218,7 @@ if args.with_decider:
         except iam_client.exceptions.NoSuchEntityException:
             _prof = iam_client.create_instance_profile(InstanceProfileName=_ec2_profile_name)
             _ec2_profile_arn = _prof["InstanceProfile"]["Arn"]
-            iam_client.add_role_to_instance_profile(
-                InstanceProfileName=_ec2_profile_name, RoleName=_ec2_role_name
-            )
+            iam_client.add_role_to_instance_profile(InstanceProfileName=_ec2_profile_name, RoleName=_ec2_role_name)
             print(f"  Created instance profile: {_ec2_profile_arn}")
             print("  Waiting 15s for IAM instance profile propagation ...")
             time.sleep(15)
@@ -1223,8 +1227,7 @@ if args.with_decider:
         _existing_reservations = ec2_client.describe_instances(
             Filters=[
                 {"Name": "tag:Name", "Values": ["DeciderServer"]},
-                {"Name": "instance-state-name",
-                 "Values": ["pending", "running", "stopping", "stopped"]},
+                {"Name": "instance-state-name", "Values": ["pending", "running", "stopping", "stopped"]},
             ]
         )["Reservations"]
 
@@ -1235,16 +1238,12 @@ if args.with_decider:
             print(f"  Found existing EC2: {_decider_instance_id} (state={_inst_state})")
             if _inst_state == "stopping":
                 print("  Waiting for stopped state before restarting ...")
-                ec2_client.get_waiter("instance_stopped").wait(
-                    InstanceIds=[_decider_instance_id]
-                )
+                ec2_client.get_waiter("instance_stopped").wait(InstanceIds=[_decider_instance_id])
                 _inst_state = "stopped"
             if _inst_state == "stopped":
                 ec2_client.start_instances(InstanceIds=[_decider_instance_id])
                 print("  Starting stopped instance ...")
-            ec2_client.get_waiter("instance_running").wait(
-                InstanceIds=[_decider_instance_id]
-            )
+            ec2_client.get_waiter("instance_running").wait(InstanceIds=[_decider_instance_id])
         else:
             # Resolve latest AL2023 x86_64 AMI from SSM Parameter Store
             _ami_id = ssm_client.get_parameter(
@@ -1272,21 +1271,19 @@ disown
                 SecurityGroupIds=[_server_sg_id],
                 IamInstanceProfile={"Arn": _ec2_profile_arn},
                 UserData=base64.b64encode(_user_data_script).decode(),
-                TagSpecifications=[{
-                    "ResourceType": "instance",
-                    "Tags": [{"Key": "Name", "Value": "DeciderServer"}],
-                }],
+                TagSpecifications=[
+                    {
+                        "ResourceType": "instance",
+                        "Tags": [{"Key": "Name", "Value": "DeciderServer"}],
+                    }
+                ],
             )
             _decider_instance_id = _run_resp["Instances"][0]["InstanceId"]
             print(f"  Launched: {_decider_instance_id}. Waiting for running state ...")
-            ec2_client.get_waiter("instance_running").wait(
-                InstanceIds=[_decider_instance_id]
-            )
+            ec2_client.get_waiter("instance_running").wait(InstanceIds=[_decider_instance_id])
 
         _inst_desc = ec2_client.describe_instances(InstanceIds=[_decider_instance_id])
-        _decider_private_ip = (
-            _inst_desc["Reservations"][0]["Instances"][0]["PrivateIpAddress"]
-        )
+        _decider_private_ip = _inst_desc["Reservations"][0]["Instances"][0]["PrivateIpAddress"]
         print(f"  EC2 private IP: {_decider_private_ip}")
         args.decider_url = f"http://{_decider_private_ip}:8000"
         print(f"  Decider server URL: {args.decider_url}")
@@ -1326,9 +1323,7 @@ disown
             VpcConfig=_lambda_vpc_config,
             Timeout=240,
         )
-        lambda_client.get_waiter("function_updated_v2").wait(
-            FunctionName="strands-decider-evaluator"
-        )
+        lambda_client.get_waiter("function_updated_v2").wait(FunctionName="strands-decider-evaluator")
         print("  Lambda VPC configured.")
 
         # Poll Strands Decider server readiness via SSM
@@ -1367,25 +1362,23 @@ disown
                     _cmd = ssm_client.send_command(
                         InstanceIds=[_decider_instance_id],
                         DocumentName="AWS-RunShellScript",
-                        Parameters={"commands": [
-                            (
-                                "printf '%s' "
-                                '\'{"state":"ping","questions":{"ping":{"type":"noul","definition":"test"}}}\''
-                                " > /tmp/decider_ping.json && "
-                                "curl -sf -m 15 -X POST http://localhost:8000/v1/systemone "
-                                "-H 'Content-Type: application/json' "
-                                "-d @/tmp/decider_ping.json > /dev/null && echo READY"
-                            )
-                        ]},
+                        Parameters={
+                            "commands": [
+                                (
+                                    "printf '%s' "
+                                    '\'{"state":"ping","questions":{"ping":{"type":"noul","definition":"test"}}}\''
+                                    " > /tmp/decider_ping.json && "
+                                    "curl -sf -m 15 -X POST http://localhost:8000/v1/systemone "
+                                    "-H 'Content-Type: application/json' "
+                                    "-d @/tmp/decider_ping.json > /dev/null && echo READY"
+                                )
+                            ]
+                        },
                     )
                     _cmd_id = _cmd["Command"]["CommandId"]
                     time.sleep(20)  # give the command time to run
-                    _inv = ssm_client.get_command_invocation(
-                        CommandId=_cmd_id, InstanceId=_decider_instance_id
-                    )
-                    if _inv.get("Status") == "Success" and "READY" in (
-                        _inv.get("StandardOutputContent") or ""
-                    ):
+                    _inv = ssm_client.get_command_invocation(CommandId=_cmd_id, InstanceId=_decider_instance_id)
+                    if _inv.get("Status") == "Success" and "READY" in (_inv.get("StandardOutputContent") or ""):
                         print(f"  Strands Decider server is ready! (attempt {_poll_attempt})")
                         _server_ready = True
                         break
@@ -1396,10 +1389,7 @@ disown
                 time.sleep(15)
 
             if not _server_ready:
-                print(
-                    "  WARNING: Server health check timed out. "
-                    "Proceeding — Lambda will retry automatically."
-                )
+                print("  WARNING: Server health check timed out. Proceeding — Lambda will retry automatically.")
 
     # Publish a Lambda version so we can create per-evaluator aliases.
     # AgentCore's code-based evaluator contract does NOT pass evaluatorName or
@@ -1458,8 +1448,7 @@ disown
         print(f"    evaluatorId: {resp['evaluatorId']}")
 
     (_RESULTS_DIR / "decider_evaluator_ids.json").write_text(
-        json.dumps({"lambda_arn": ARN_DECIDER, "server_url": args.decider_url,
-                    "evaluator_ids": decider_ids}, indent=2)
+        json.dumps({"lambda_arn": ARN_DECIDER, "server_url": args.decider_url, "evaluator_ids": decider_ids}, indent=2)
     )
 
     # Invoke agent and evaluate with Strands Decider evaluators
@@ -1474,9 +1463,11 @@ disown
 
     decider_ec = EvaluationClient(region_name=REGION)
     decider_ec._evaluator_level_cache.update(
-        {decider_ids["DeciderGroundedness"]: "TRACE",
-         decider_ids["DeciderHelpfulness"]: "TRACE",
-         decider_ids["DeciderGoalCompletion"]: "SESSION"}
+        {
+            decider_ids["DeciderGroundedness"]: "TRACE",
+            decider_ids["DeciderHelpfulness"]: "TRACE",
+            decider_ids["DeciderGoalCompletion"]: "SESSION",
+        }
     )
 
     decider_results = decider_ec.run(
@@ -1500,8 +1491,11 @@ disown
         print(f"  {name:<30} {value!s:<8} {label!s}")
 
     (_RESULTS_DIR / "decider_results.json").write_text(
-        json.dumps({"session_id": DECIDER_SESSION_ID, "results": decider_results,
-                    "evaluator_ids": decider_ids}, indent=2, default=str)
+        json.dumps(
+            {"session_id": DECIDER_SESSION_ID, "results": decider_results, "evaluator_ids": decider_ids},
+            indent=2,
+            default=str,
+        )
     )
     print(f"\n  Strands Decider results saved: {_RESULTS_DIR / 'decider_results.json'}")
 
